@@ -255,7 +255,7 @@ module I18n
         # toplevel keys.
         def load_json(filename)
           begin
-            ::JSON.parse(File.read(filename))
+            ::JSON.parse(File.read(filename), symbolize_names: true, freeze: true)
           rescue TypeError, StandardError => e
             raise InvalidLocaleData.new(filename, e.inspect)
           end
