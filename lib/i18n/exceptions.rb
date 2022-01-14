@@ -110,4 +110,13 @@ module I18n
       super "can not load translations from #{filename}, the file type #{type} is not known"
     end
   end
+
+  class UnsupportedMethod < ArgumentError
+    attr_reader :method, :backend_klass
+    def initialize(method, backend_klass)
+      @method = method
+      @backend_klass = backend_klass
+      super "#{backend_klass} does not support the ##{method} method"
+    end
+  end
 end
