@@ -1,11 +1,11 @@
 require 'test_helper'
 
-class I18nBackendLazyLoadTest < I18n::TestCase
+class I18nBackendLazyLoadableTest < I18n::TestCase
   def setup
     super
 
-    @lazy_mode_backend = I18n::Backend::LazyLoad.new(lazy_load: true)
-    @eager_mode_backend = I18n::Backend::LazyLoad.new(lazy_load: false)
+    @lazy_mode_backend = I18n::Backend::LazyLoadable.new(lazy_load: true)
+    @eager_mode_backend = I18n::Backend::LazyLoadable.new(lazy_load: false)
 
     I18n.load_path = [File.join(locales_dir, '/en.yml'), File.join(locales_dir,  '/fr.yml')]
   end
@@ -69,7 +69,7 @@ class I18nBackendLazyLoadTest < I18n::TestCase
   test "lazy mode: eager_load! raises UnsupportedMethod exception" do
     with_lazy_mode do
       exception = assert_raises(I18n::UnsupportedMethod) { @backend.eager_load! }
-      assert_equal "I18n::Backend::LazyLoad does not support the #eager_load! method", exception.message
+      assert_equal "I18n::Backend::LazyLoadable does not support the #eager_load! method", exception.message
     end
   end
 

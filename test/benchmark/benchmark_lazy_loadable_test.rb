@@ -2,9 +2,9 @@ require 'test_helper'
 require 'benchmark'
 require 'securerandom'
 
-class BenchmarkLazyLoadTest < I18n::TestCase
+class BenchmarkLazyLoadableTest < I18n::TestCase
   test "lazy load performance" do
-    benchmark(backend: I18n::Backend::LazyLoad.new(lazy_load: true))
+    benchmark(backend: I18n::Backend::LazyLoadable.new(lazy_load: true))
   end
 
   test "simple performance" do

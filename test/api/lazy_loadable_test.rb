@@ -1,8 +1,8 @@
 require 'test_helper'
 
-class I18nLazyLoadBackendApiTest < I18n::TestCase
+class I18nLazyLoadableBackendApiTest < I18n::TestCase
   def setup
-    I18n.backend = I18n::Backend::LazyLoad.new
+    I18n.backend = I18n::Backend::LazyLoadable.new
     super
   end
 
@@ -18,7 +18,7 @@ class I18nLazyLoadBackendApiTest < I18n::TestCase
   include I18n::Tests::Localization::Time
   include I18n::Tests::Localization::Procs
 
-  test "make sure we use the LazyLoad backend" do
-    assert_equal I18n::Backend::LazyLoad, I18n.backend.class
+  test "make sure we use the LazyLoadable backend" do
+    assert_equal I18n::Backend::LazyLoadable, I18n.backend.class
   end
 end

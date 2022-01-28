@@ -36,9 +36,6 @@ module I18n
     #
     # The backend has two working modes: lazy_load and eager_load.
     #
-    # This is configured using I18n.lazy_loadable_backed.lazy_load
-    # which defaults to false.
-    #
     # We recommend enabling this to true in test environments only.
     # When the mode is set to false, the backend behaves exactly like the
     # Simple backend, with an additional check that the paths being loaded
@@ -49,13 +46,11 @@ module I18n
     #
     #   # In test environments
     #
-    #   I18n.lazy_loadable_backend.lazy_load = true
-    #   I18n.backend = I18n::Backend::LazyLoad.new
+    #   I18n.backend = I18n::Backend::LazyLoadable.new(lazy_load: true)
     #
     #   # In other environments, such as Prod and CI
     #
-    #   I18n.lazy_loadable_backend.lazy_load = false # default
-    #   I18n.backend = I18n::Backend::LazyLoad.new
+    #   I18n.backend = I18n::Backend::LazyLoadable.new(lazy_load: false) # default
     #
     class LocaleExtractor
       class << self
@@ -67,7 +62,7 @@ module I18n
       end
     end
 
-    class LazyLoad < Simple
+    class LazyLoadable < Simple
       def initialize(lazy_load: false)
         @lazy_load = lazy_load
       end
