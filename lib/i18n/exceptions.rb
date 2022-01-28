@@ -119,4 +119,12 @@ module I18n
       super "#{backend_klass} does not support the ##{method} method"
     end
   end
+
+  class InvalidFilenames < ArgumentError
+    attr_reader :invalid_filenames
+
+    def initialize(invalid_filenames)
+      super "Locales cannot be extracted from the following paths: #{invalid_filenames}"
+    end
+  end
 end

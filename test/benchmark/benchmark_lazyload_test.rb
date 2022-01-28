@@ -4,7 +4,7 @@ require 'securerandom'
 
 class BenchmarkLazyLoadTest < I18n::TestCase
   test "lazy load performance" do
-    benchmark(backend: I18n::Backend::LazyLoad.new)
+    benchmark(backend: I18n::Backend::LazyLoad.new(lazy_load: true))
   end
 
   test "simple performance" do
@@ -15,14 +15,18 @@ class BenchmarkLazyLoadTest < I18n::TestCase
     @backend = I18n.backend = backend
     @backend.reload!
 
-    en_files = create_temp_translation_files(locale: "en", num_files: 100, num_keys: 1000)
-    fr_files = create_temp_translation_files(locale: "fr", num_files: 100, num_keys: 1000)
-    de_files = create_temp_translation_files(locale: "de", num_files: 100, num_keys: 1000)
+    num_files = 100
+    num_keys = 100
+
+    en_files = create_temp_translation_files(locale: "en", num_files: num_files, num_keys: num_keys)
+    fr_files = create_temp_translation_files(locale: "fr", num_files: num_files, num_keys: num_keys)
+    de_files = create_temp_translation_files(locale: "de", num_files: num_files, num_keys: num_keys)
 
     Benchmark.bm do |x|
       puts "\n"
       x.report(@backend.class) do
         I18n.with_locale(:en) { I18n.t("1.1") }
+        assert_equal num_keys * num_files, translations[:en].size
       end
     end
 
@@ -34,7 +38,7 @@ class BenchmarkLazyLoadTest < I18n::TestCase
   def create_temp_translation_files(locale:, num_files:, num_keys:)
     paths = []
     num_files.times do |file_num|
-      path = File.join(Dir.tmpdir, "#{locale}-#{SecureRandom.uuid}.yml")
+      path = File.join(Dir.tmpdir, "#{locale}_#{SecureRandom.uuid}.yml")
       File.write(path, generate_random_file_content(locale, num_keys, file_num))
 
       paths << path

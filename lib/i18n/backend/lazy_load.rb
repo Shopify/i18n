@@ -15,71 +15,132 @@ module I18n
     # Specifically, a translation file is considered to belong to a locale if:
     # a) the filename is in the I18n load path
     # b) the filename ends in a supported extension (ie. .yml, .json, .po, .rb)
-    # c1) the filename starts with the locale identifier
-    #    OR
-    # c2) the path contains a component equal to the locale identifier
+    # c) the filename starts with the locale identifier
+    # d) the locale identifier and optional proceeding text is separated by an underscore, ie. "_".
     #
     # Examples:
     # Valid files that will be selected by this backend:
     #
-    # "files/locales/en-translation.yml" (Selected for locale "en")
-    # "files/locales/fr/translation.po"  (Selected for locale "fr")
+    # "files/locales/en_translation.yml" (Selected for locale "en")
+    # "files/locales/fr.po"  (Selected for locale "fr")
     #
     # Invalid files that won't be selected by this backend:
     #
     # "files/locales/translation-file"
     # "files/locales/en-translation.unsupported"
     # "files/locales/french/translation.yml"
+    # "files/locales/fr/translation.yml"
     #
     # The implementation uses this assumption to defer the loading of
     # translation files until the current locale actually requires them.
     #
-    # Note: This backend isn't designed for production environments or other
-    # environments where eager loading all translations is recommended.
+    # The backend has two working modes: lazy_load and eager_load.
     #
-    # To use the LazyLoad backend instantiate it and set it to the I18n module.
+    # This is configured using I18n.lazy_loadable_backed.lazy_load
+    # which defaults to false.
+    #
+    # We recommend enabling this to true in test environments only.
+    # When the mode is set to false, the backend behaves exactly like the
+    # Simple backend, with an additional check that the paths being loaded
+    # abide by the format. If paths can't be matched to the format, an error is raised.
+    #
     # You can configure lazy loaded backends through the initializer or backends
     # accessor:
     #
-    #   # configure I18n backend to use LazyLoad Backend
+    #   # In test environments
+    #
+    #   I18n.lazy_loadable_backend.lazy_load = true
     #   I18n.backend = I18n::Backend::LazyLoad.new
     #
+    #   # In other environments, such as Prod and CI
+    #
+    #   I18n.lazy_loadable_backend.lazy_load = false # default
+    #   I18n.backend = I18n::Backend::LazyLoad.new
+    #
+    class LocaleExtractor
+      class << self
+        def locale_from_path(path)
+          name = File.basename(path, ".*")
+          locale = name.split("_").first
+          locale.to_sym unless locale.nil?
+        end
+      end
+    end
+
     class LazyLoad < Simple
+      def initialize(lazy_load: false)
+        @lazy_load = lazy_load
+      end
+
       # Returns whether the current locale is initialized.
       def initialized?
-        initialized_locales[I18n.locale]
+        if lazy_load?
+          initialized_locales[I18n.locale]
+        else
+          super
+        end
       end
 
       # Clean up translations and uninitialize all locales.
       def reload!
-        @initialized_locales = nil
-        @translations = nil
+        if lazy_load?
+          @initialized_locales = nil
+          @translations = nil
+        else
+          super
+        end
       end
 
+      # Eager loading is not supported in the lazy context.
       def eager_load!
-        raise UnsupportedMethod.new(__method__, self.class)
+        if lazy_load?
+          raise UnsupportedMethod.new(__method__, self.class)
+        else
+          super
+        end
+      end
+
+      # Select all files from I18n load path that belong to current locale.
+      # These files must start with the locale identifier (ie. "en", "pt-BR"),
+      # followed by an "_" demarcation to separate proceeding text.
+      def filenames_for_current_locale
+        I18n.load_path.flatten.select do |path|
+          LocaleExtractor.locale_from_path(path) == I18n.locale &&
+          supported_extension?(path)
+        end
+      end
+
+      # Parse the load path and extract all locales.
+      def available_locales
+        if lazy_load?
+          I18n.load_path.map { |path| LocaleExtractor.locale_from_path(path) }
+        else
+          super
+        end
       end
 
       protected
 
       # Load translations from files that belong to the current locale.
       def init_translations
-        load_translations(filenames_for_current_locale)
-        initialized_locales[I18n.locale] = true
+        if lazy_load?
+          load_translations(filenames_for_current_locale)
+          initialized_locales[I18n.locale] = true
+        else
+          super
+          filenames_named_incorrectly = I18n.load_path.reject { |path| file_named_correctly?(path) }
+          raise InvalidFilenames.new(filenames_named_incorrectly) unless filenames_named_incorrectly.empty?
+        end
       end
 
       def initialized_locales
         @initialized_locales ||= Hash.new(false)
       end
 
-      # Select all files from I18n load path that belong to current locale.
-      # These files must start with the locale identifier (ie. "en", "fr").
-      # or contain a path component equal to the locale identifier (ie. /locales/en/translation.yml)
-      def filenames_for_current_locale
-        I18n.load_path.flatten.select do |path|
-          (basename_starts_with_locale?(path) || path_contains_locale_identifier?(path)) &&
-          supported_extension?(path)
-        end
+      private
+
+      def lazy_load?
+        @lazy_load
       end
 
       SUPPORTED_EXTENSIONS = [".yml", ".yaml", ".po", ".json", ".rb"].freeze
@@ -88,12 +149,9 @@ module I18n
         path.end_with?(*SUPPORTED_EXTENSIONS)
       end
 
-      def basename_starts_with_locale?(path)
-        File.basename(path).start_with?(I18n.locale.to_s)
-      end
-
-      def path_contains_locale_identifier?(path)
-        Pathname.new(path).each_filename.any? { |component| component == I18n.locale.to_s }
+      def file_named_correctly?(path)
+        extracted_locale = LocaleExtractor.locale_from_path(path)
+        available_locales.include?(extracted_locale)
       end
     end
   end
