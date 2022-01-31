@@ -9,7 +9,7 @@ module I18n
         I18n.backend.store_translations('de', :foo => 'bar')
         I18n.backend.store_translations('en', :foo => 'foo')
 
-        assert_equal I18n.backend.available_locales, I18n.available_locales
+        assert_equal I18n.available_locales, I18n.backend.available_locales
       end
 
       test "available_locales can be set to something else independently from the actual locale data" do
@@ -23,7 +23,7 @@ module I18n
         assert_equal [:foo, :bar], I18n.available_locales
 
         I18n.available_locales = nil
-        assert_equal I18n.backend.available_locales, I18n.available_locales
+        assert_equal I18n.available_locales, I18n.backend.available_locales
       end
 
       test "available_locales memoizes when set explicitely" do

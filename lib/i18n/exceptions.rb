@@ -121,10 +121,26 @@ module I18n
   end
 
   class InvalidFilenames < ArgumentError
-    attr_reader :invalid_filenames
+    NUMBER_OF_ERRORS_SHOWN = 20
+    def initialize(file_errors)
+      super <<~MSG
+        Found #{file_errors.count} error(s).
+        The first #{[file_errors.count, NUMBER_OF_ERRORS_SHOWN].min} error(s):
+        #{file_errors.map(&:message).first(NUMBER_OF_ERRORS_SHOWN).join("\n")}
 
-    def initialize(invalid_filenames)
-      super "Locales cannot be extracted from the following paths: #{invalid_filenames}"
+        To use the LazyLoadable backend:
+        1. Filenames must start with the locale.
+        2. An underscore must separate the locale with any optional text that follows.
+        3. The file must only contain translation data for the single locale.
+
+        Example:
+        "/config/locales/fr.yml" which contains:
+        ```yml
+          fr:
+            dog:
+              chien
+        ```
+      MSG
     end
   end
 end

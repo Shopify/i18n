@@ -36,7 +36,7 @@ module I18n
     #
     # The backend has two working modes: lazy_load and eager_load.
     #
-    # We recommend enabling this to true in test environments only.
+    # Note: This backend should only be enabled in in test environments!
     # When the mode is set to false, the backend behaves exactly like the
     # Simple backend, with an additional check that the paths being loaded
     # abide by the format. If paths can't be matched to the format, an error is raised.
@@ -48,7 +48,7 @@ module I18n
     #
     #   I18n.backend = I18n::Backend::LazyLoadable.new(lazy_load: true)
     #
-    #   # In other environments, such as Prod and CI
+    #   # In other environments, such as production and CI
     #
     #   I18n.backend = I18n::Backend::LazyLoadable.new(lazy_load: false) # default
     #
@@ -95,16 +95,6 @@ module I18n
         end
       end
 
-      # Select all files from I18n load path that belong to current locale.
-      # These files must start with the locale identifier (ie. "en", "pt-BR"),
-      # followed by an "_" demarcation to separate proceeding text.
-      def filenames_for_current_locale
-        I18n.load_path.flatten.select do |path|
-          LocaleExtractor.locale_from_path(path) == I18n.locale &&
-          supported_extension?(path)
-        end
-      end
-
       # Parse the load path and extract all locales.
       def available_locales
         if lazy_load?
@@ -116,16 +106,18 @@ module I18n
 
       protected
 
+
       # Load translations from files that belong to the current locale.
       def init_translations
-        if lazy_load?
-          load_translations(filenames_for_current_locale)
+        file_errors = if lazy_load?
           initialized_locales[I18n.locale] = true
+          load_translations_and_collect_file_errors(filenames_for_current_locale)
         else
-          super
-          filenames_named_incorrectly = I18n.load_path.reject { |path| file_named_correctly?(path) }
-          raise InvalidFilenames.new(filenames_named_incorrectly) unless filenames_named_incorrectly.empty?
+          @initialized = true
+          load_translations_and_collect_file_errors(I18n.load_path)
         end
+
+        raise InvalidFilenames.new(file_errors) unless file_errors.empty?
       end
 
       def initialized_locales
@@ -138,15 +130,44 @@ module I18n
         @lazy_load
       end
 
-      SUPPORTED_EXTENSIONS = [".yml", ".yaml", ".po", ".json", ".rb"].freeze
-
-      def supported_extension?(path)
-        path.end_with?(*SUPPORTED_EXTENSIONS)
+      class FilenameIncorrect < StandardError
+        def initialize(file, expected_locale, unexpected_locales)
+          super "#{file} can only load translations for \"#{expected_locale}\". Found translations for: #{unexpected_locales}."
+        end
       end
 
-      def file_named_correctly?(path)
-        extracted_locale = LocaleExtractor.locale_from_path(path)
-        available_locales.include?(extracted_locale)
+      # Loads each file supplied and asserts that the file only loads
+      # translations as expected by the name. The method returns a list of
+      # errors corresponding to offending files.
+      def load_translations_and_collect_file_errors(files)
+        errors = []
+
+        load_translations(files) do |file, loaded_translations|
+          assert_file_named_correctly!(file, loaded_translations)
+        rescue FilenameIncorrect => e
+          errors << e
+        end
+
+        errors
+      end
+
+      # Select all files from I18n load path that belong to current locale.
+      # These files must start with the locale identifier (ie. "en", "pt-BR"),
+      # followed by an "_" demarcation to separate proceeding text.
+      def filenames_for_current_locale
+        I18n.load_path.flatten.select do |path|
+          LocaleExtractor.locale_from_path(path) == I18n.locale
+        end
+      end
+
+      # Checks if a filename is named in correspondence to the translations it loaded.
+      # The locale extracted from the path must be the single locale loaded in the translations.
+      def assert_file_named_correctly!(file, translations)
+        loaded_locales = translations.keys.map(&:to_sym)
+        expected_locale = LocaleExtractor.locale_from_path(file)
+        unexpected_locales = loaded_locales.reject { |locale| locale == expected_locale }
+
+        raise FilenameIncorrect.new(file, expected_locale, unexpected_locales) unless unexpected_locales.empty?
       end
     end
   end

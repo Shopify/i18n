@@ -73,13 +73,12 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
     end
   end
 
-  test "lazy mode: loads translations from files that start with current locale identifier or contain identifier in path components, and end with a supported extension" do
+  test "lazy mode: loads translations from files that start with current locale identifier" do
     with_lazy_mode do
       file_contents = { en: { alice: "bob" } }.to_yaml
 
       invalid_files = [
         { filename: ['translation', '.yml'] },                # No locale identifier
-        { filename: ['en_translation', '.unsupported'] },     # Unsupported extension
         { filename: ['translation', '.unsupported'] },        # No locale identifier and unsupported extension
       ]
 
@@ -104,10 +103,49 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
     end
   end
 
+  test "lazy mode: files with unsupported extensions raise UnknownFileType error" do
+    with_lazy_mode do
+      file_contents = { en: { alice: "bob" } }.to_yaml
+      filename =  ['en_translation', '.unsupported']     # Correct locale identifier, but unsupported extension
+
+      with_translation_file_in_load_path(filename, nil, file_contents) do
+        assert_raises(I18n::UnknownFileType) { I18n.t("foo.bar") }
+      end
+    end
+  end
+
   test "lazy mode: #available_locales returns all locales available from load path irrespective of current locale" do
     with_lazy_mode do
       I18n.with_locale(:en) { assert_equal [:en, :fr], @backend.available_locales }
       I18n.with_locale(:fr) { assert_equal [:en, :fr], @backend.available_locales }
+    end
+  end
+
+  test "lazy mode: raises error if translations loaded don't correspond to locale extracted from filename" do
+    filename = ["en_", ".yml"]
+    file_contents = { fr: { dog: "chien" } }.to_yaml
+
+    with_lazy_mode do
+      with_translation_file_in_load_path(filename, nil, file_contents) do |file_path|
+        exception = assert_raises(I18n::InvalidFilenames) { I18n.t("foo.bar") }
+
+        expected_message = /#{Regexp.escape(file_path)} can only load translations for "en"\. Found translations for: \[\:fr\]/
+        assert_match expected_message, exception.message
+      end
+    end
+  end
+
+  test "lazy mode: raises error if translations for more than one locale are loaded from a single file" do
+    filename = ["en_", ".yml"]
+    file_contents = { en: { alice: "bob" },  fr: { dog: "chien" }, de: { cat: 'katze' } }.to_yaml
+
+    with_lazy_mode do
+      with_translation_file_in_load_path(filename, nil, file_contents) do |file_path|
+        exception = assert_raises(I18n::InvalidFilenames) { I18n.t("foo.bar") }
+
+        expected_message = /#{Regexp.escape(file_path)} can only load translations for "en"\. Found translations for: \[\:fr\, \:de\]/
+        assert_match expected_message, exception.message
+      end
     end
   end
 
@@ -128,9 +166,11 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
 
       contents = { de: { cat: 'katze' } }.to_yaml
 
-      with_translation_file_in_load_path(['translation', '.yml'], nil, contents) do |file_path|
+      with_translation_file_in_load_path(['fr_translation', '.yml'], nil, contents) do |file_path|
         exception = assert_raises(I18n::InvalidFilenames) { I18n.t("foo.bar") }
-        assert_equal "Locales cannot be extracted from the following paths: #{[file_path]}", exception.message
+
+        expected_message = /#{Regexp.escape(file_path)} can only load translations for "fr"\. Found translations for: \[\:de\]/
+        assert_match expected_message, exception.message
       end
     end
   end
