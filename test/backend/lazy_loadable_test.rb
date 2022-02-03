@@ -149,6 +149,19 @@ class I18nBackendLazyLoadableTest < I18n::TestCase
     end
   end
 
+  test "lazy mode: #lookup lazy loads translations for supplied locale" do
+    with_lazy_mode do
+      @backend.reload!
+      assert_nil translations
+
+      I18n.with_locale(:en) do
+        assert_equal "chien", @backend.lookup(:fr, "animal.dog")
+      end
+
+      assert_equal({ fr: { animal: { dog: "chien" } } }, translations)
+    end
+  end
+
   test "eager mode: load all translations, irrespective of locale" do
     with_eager_mode do
       @backend.reload!

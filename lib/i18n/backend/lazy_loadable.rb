@@ -104,6 +104,16 @@ module I18n
         end
       end
 
+      def lookup(locale, key, scope = [], options = EMPTY_HASH)
+        if lazy_load?
+          I18n.with_locale(locale) do
+            super
+          end
+        else
+          super
+        end
+      end
+
       protected
 
 
