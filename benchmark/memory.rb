@@ -159,8 +159,14 @@ compact_values_stats = measure_retained(compact_backend.instance_variable_get(:@
 compact_tree_stats = measure_retained(compact_backend.instance_variable_get(:@translations))
 compact_subtree_stats = measure_retained(compact_backend.instance_variable_get(:@subtree_keys))
 
-compact_total_bytes = compact_schema_stats[:bytes] + compact_values_stats[:bytes] + compact_tree_stats[:bytes] + compact_subtree_stats[:bytes]
-compact_total_objects = compact_schema_stats[:objects] + compact_values_stats[:objects] + compact_tree_stats[:objects] + compact_subtree_stats[:objects]
+# Binary string table stats
+string_table = compact_backend.instance_variable_get(:@string_table)
+objects_table = compact_backend.instance_variable_get(:@objects_table)
+string_table_bytes = string_table ? (ObjectSpace.memsize_of(string_table) rescue 0) : 0
+objects_table_stats = objects_table ? measure_retained(objects_table) : { bytes: 0, objects: 0 }
+
+compact_total_bytes = compact_schema_stats[:bytes] + compact_values_stats[:bytes] + compact_tree_stats[:bytes] + compact_subtree_stats[:bytes] + string_table_bytes + objects_table_stats[:bytes]
+compact_total_objects = compact_schema_stats[:objects] + compact_values_stats[:objects] + compact_tree_stats[:objects] + compact_subtree_stats[:objects] + 1 + objects_table_stats[:objects]
 
 I18n.backend = compact_backend
 # Warm up
@@ -197,6 +203,8 @@ puts "  Retained objects: #{format_number(compact_total_objects)}"
 puts "  Breakdown:"
 puts "    Schema hash:     #{format_bytes(compact_schema_stats[:bytes])} (#{format_number(compact_schema_stats[:objects])} objects)"
 puts "    Value arrays:    #{format_bytes(compact_values_stats[:bytes])} (#{format_number(compact_values_stats[:objects])} objects)"
+puts "    String table:    #{format_bytes(string_table_bytes)} (1 buffer, #{string_table ? format_bytes(string_table.bytesize) : '0 B'} data)"
+puts "    Objects table:   #{format_bytes(objects_table_stats[:bytes])} (#{format_number(objects_table_stats[:objects])} objects)"
 puts "    Subtree index:   #{format_bytes(compact_subtree_stats[:bytes])} (#{format_number(compact_subtree_stats[:objects])} objects)"
 puts "    Marker tree:     #{format_bytes(compact_tree_stats[:bytes])} (#{format_number(compact_tree_stats[:objects])} objects)"
 puts "  Leaf lookup (100k):    #{'%.1f' % (compact_leaf_time * 1000)} ms"
@@ -219,17 +227,27 @@ puts "  Leaf lookup:     #{'%.1f' % (simple_leaf_time * 1000)} ms -> #{'%.1f' % 
 puts "  Subtree lookup:  #{'%.1f' % (simple_subtree_time * 1000)} ms -> #{'%.1f' % (compact_subtree_time * 1000)} ms (#{'%.2f' % subtree_speedup}x #{subtree_speedup > 1 ? 'faster' : 'slower'})"
 puts
 
-# ========== String Deduplication ==========
+# ========== String Table Stats ==========
 puts "-" * 70
-puts "String Deduplication"
+puts "String Table"
 puts "-" * 70
-value_arrays = compact_backend.instance_variable_get(:@value_arrays)
-all_values = []
-value_arrays.each { |_, arr| arr.each { |v| all_values << v if v.is_a?(String) } }
-total = all_values.size
-unique_id = all_values.group_by(&:object_id).size
-unique_content = all_values.uniq.size
-puts "  Strings across all locales: #{format_number(total)}"
-puts "  Unique by content:          #{format_number(unique_content)}"
-puts "  Unique by object identity:  #{format_number(unique_id)}"
-puts "  Strings shared via dedup:   #{format_number(total - unique_id)} (#{((total - unique_id).to_f / [total, 1].max * 100).round(1)}%)"
+if string_table
+  # Count total string refs across all locales
+  value_arrays = compact_backend.instance_variable_get(:@value_arrays)
+  total_string_refs = 0
+  unique_packed = {}
+  value_arrays.each do |_, arr|
+    arr.each do |v|
+      next unless v.is_a?(Integer) && v >= 0
+      total_string_refs += 1
+      unique_packed[v] = true
+    end
+  end
+  puts "  String buffer size:         #{format_bytes(string_table.bytesize)}"
+  puts "  String refs across locales: #{format_number(total_string_refs)}"
+  puts "  Unique packed refs:         #{format_number(unique_packed.size)}"
+  puts "  Dedup ratio:                #{'%.1f' % (total_string_refs.to_f / [unique_packed.size, 1].max)}x"
+  puts "  Objects table entries:      #{format_number(objects_table ? objects_table.size : 0)}"
+else
+  puts "  (no string table — not using binary string table approach)"
+end

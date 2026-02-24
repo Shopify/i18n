@@ -220,4 +220,14 @@ class I18nBackendCompactTest < I18n::TestCase
 
     assert_equal 'default', I18n.t(:nil_val, default: 'default')
   end
+
+  # Edge case: very long strings (> 64KB)
+
+  test "compact!: handles strings longer than 64KB" do
+    long_string = "x" * 70_000
+    store_translations(:en, :long => long_string)
+    I18n.backend.compact!
+
+    assert_equal long_string, I18n.t(:long)
+  end
 end
