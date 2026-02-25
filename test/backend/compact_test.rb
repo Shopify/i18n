@@ -230,4 +230,205 @@ class I18nBackendCompactTest < I18n::TestCase
 
     assert_equal long_string, I18n.t(:long)
   end
+
+  # ================================================================
+  # Cache tests
+  # ================================================================
+
+  def with_cache_file
+    require 'tempfile'
+    file = Tempfile.new(['i18n_compact', '.cache'])
+    path = file.path
+    file.close
+    file.unlink  # start with no file
+    yield path
+  ensure
+    File.delete(path) if path && File.exist?(path)
+  end
+
+  # Basic cache write and read
+
+  test "cache: writes and loads cache file" do
+    with_cache_file do |path|
+      store_translations(:en, :cached => 'hello from cache')
+      I18n.backend.compact!(cache_path: path)
+
+      assert File.exist?(path), "Cache file should be written"
+      assert File.size(path) > 0, "Cache file should not be empty"
+
+      # Create a new backend and load from cache.
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :cached => 'hello from cache')
+      I18n.backend.compact!(cache_path: path)
+
+      assert_equal 'hello from cache', I18n.t(:cached)
+    end
+  end
+
+  test "cache: loaded cache produces same lookups as fresh compaction" do
+    with_cache_file do |path|
+      store_translations(:en, :greeting => 'Hello')
+      store_translations(:en, :nested => { :a => 'alpha', :b => 'beta' })
+      store_translations(:en, :colors => %w(red green blue))
+      store_translations(:fr, :greeting => 'Bonjour')
+      I18n.backend.compact!(cache_path: path)
+
+      # Record expected values.
+      expected_greeting_en = I18n.t(:greeting, locale: :en)
+      expected_greeting_fr = I18n.t(:greeting, locale: :fr)
+      expected_nested = I18n.t(:nested, locale: :en)
+      expected_colors = I18n.t(:colors, locale: :en)
+
+      # Load from cache in a fresh backend.
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :greeting => 'Hello')
+      store_translations(:en, :nested => { :a => 'alpha', :b => 'beta' })
+      store_translations(:en, :colors => %w(red green blue))
+      store_translations(:fr, :greeting => 'Bonjour')
+      I18n.backend.compact!(cache_path: path)
+
+      assert_equal expected_greeting_en, I18n.t(:greeting, locale: :en)
+      assert_equal expected_greeting_fr, I18n.t(:greeting, locale: :fr)
+      assert_equal expected_nested, I18n.t(:nested, locale: :en)
+      assert_equal expected_colors, I18n.t(:colors, locale: :en)
+    end
+  end
+
+  # Cache invalidation
+
+  test "cache: invalidates when load_path content changes" do
+    require 'tempfile'
+    yml = Tempfile.new(['locale', '.yml'])
+    yml.write("en:\n  msg: original\n")
+    yml.flush
+
+    with_cache_file do |path|
+      I18n.load_path = [yml.path]
+      # Use content digest so the test doesn't depend on mtime granularity.
+      I18n.backend.eager_load!(cache_path: path, cache_digest: true)
+      assert_equal 'original', I18n.t(:msg)
+
+      # Rewrite the file with different content.
+      File.write(yml.path, "en:\n  msg: updated\n")
+
+      # New backend — content digest should differ, so cache is rebuilt.
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [yml.path]
+      I18n.backend.eager_load!(cache_path: path, cache_digest: true)
+      assert_equal 'updated', I18n.t(:msg)
+    end
+  ensure
+    yml.close!
+  end
+
+  test "cache: invalidates when load_path files change" do
+    with_cache_file do |path|
+      I18n.backend.eager_load!(cache_path: path)
+      assert_equal 'baz', I18n.t('foo.bar')
+
+      # Add a new file to load_path — fingerprint changes.
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml', locales_dir + '/fr.yml']
+      I18n.backend.eager_load!(cache_path: path)
+
+      # French translations should now be available.
+      assert I18n.available_locales.include?(:fr)
+    end
+  end
+
+  # Cache with content digest
+
+  test "cache: works with cache_digest option" do
+    with_cache_file do |path|
+      store_translations(:en, :digest_test => 'value')
+      I18n.backend.compact!(cache_path: path, cache_digest: true)
+      assert_equal 'value', I18n.t(:digest_test)
+
+      # Load from cache with same digest.
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :digest_test => 'value')
+      I18n.backend.compact!(cache_path: path, cache_digest: true)
+      assert_equal 'value', I18n.t(:digest_test)
+    end
+  end
+
+  # Cache does not crash on missing/corrupt file
+
+  test "cache: handles missing cache file gracefully" do
+    store_translations(:en, :test => 'val')
+    I18n.backend.compact!(cache_path: '/tmp/nonexistent_i18n_cache_file_that_does_not_exist.cache')
+    assert_equal 'val', I18n.t(:test)
+  end
+
+  test "cache: handles corrupt cache file gracefully" do
+    with_cache_file do |path|
+      File.binwrite(path, "corrupt data here")
+      store_translations(:en, :test => 'val')
+      I18n.backend.compact!(cache_path: path)
+      assert_equal 'val', I18n.t(:test)
+    end
+  end
+
+  # Cache with Proc values
+
+  test "cache: rebuilds proc values from .rb locale files" do
+    with_cache_file do |path|
+      I18n.load_path = [locales_dir + '/en.yml', locales_dir + '/en.rb']
+      I18n.backend.eager_load!(cache_path: path)
+
+      # en.rb defines :en => { :fuh => { :bah => "bas" } }
+      assert_equal 'bas', I18n.t('fuh.bah')
+
+      # Load from cache.
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml', locales_dir + '/en.rb']
+      I18n.backend.eager_load!(cache_path: path)
+      assert_equal 'bas', I18n.t('fuh.bah')
+    end
+  end
+
+  test "cache: programmatic procs survive round-trip when re-stored before compact" do
+    # Procs injected via store_translations (not from .rb files) can't be
+    # deserialized from cache. However, if the same proc is re-stored before
+    # compact!, the fresh compaction rebuilds everything including the proc.
+    with_cache_file do |path|
+      my_proc = lambda { |*args| 'from lambda' }
+      store_translations(:en, :dynamic => my_proc)
+      I18n.backend.compact!(cache_path: path)
+      assert_equal 'from lambda', I18n.t(:dynamic)
+    end
+  end
+
+  # eager_load! with cache
+
+  test "eager_load!: passes cache_path through to compact!" do
+    with_cache_file do |path|
+      I18n.backend.eager_load!(cache_path: path)
+      assert File.exist?(path), "Cache file should be written by eager_load!"
+      assert_equal 'baz', I18n.t('foo.bar')
+    end
+  end
+
+  # Cache with multiple locales
+
+  test "cache: preserves multiple locales" do
+    with_cache_file do |path|
+      I18n.load_path = [locales_dir + '/en.yml', locales_dir + '/fr.yml']
+      I18n.backend.eager_load!(cache_path: path)
+
+      en_val = I18n.t('foo.bar', locale: :en)
+
+      # Load from cache.
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml', locales_dir + '/fr.yml']
+      I18n.backend.eager_load!(cache_path: path)
+
+      assert_equal en_val, I18n.t('foo.bar', locale: :en)
+      assert I18n.available_locales.include?(:en)
+      assert I18n.available_locales.include?(:fr)
+    end
+  end
 end

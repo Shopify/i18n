@@ -49,9 +49,39 @@ Benchmark comparing `I18n::Backend::Simple` vs `I18n::Backend::Simple` + `I18n::
 ### Notes
 
 - **RSS vs retained memory:** The RSS savings (18.2%) is lower than retained memory savings (68.2%) because RSS includes transient allocations during YAML parsing that are freed but not returned to the OS. The retained memory figure better represents the steady-state savings in a long-running process after GC compaction.
-- **Load time:** The ~27% slower load time is a one-time cost at boot. In production with `eager_load!`, this happens once during startup.
+- **Load time:** The ~27% slower load time is a one-time cost at boot. In production with `eager_load!`, this happens once during startup. With caching enabled (see below), subsequent boots are 12.5x faster.
 - **Leaf lookups** are 1.60x faster because the compact path avoids traversing nested Hash chains — it's a single schema hash lookup + array index + buffer slice.
 - Only **308 non-string values** exist in the entire Shopify translation corpus (arrays for day/month names, etc.). Nearly all translations are strings.
+
+## Cache Performance (Real Shopify Files)
+
+When a cache file is provided via `eager_load!(cache_path: "...")`, the compacted index is serialized to disk after the first boot. On subsequent boots, the cache is loaded directly — skipping all YAML parsing and compaction.
+
+| Metric | Simple | Compact (fresh) | Compact (cached) |
+|---|---|---|---|
+| **Load time** | 21.40 s | 26.75 s | **1.71 s** |
+| **RSS delta** | 1,348 MB | 1,128 MB | **676 MB** |
+| **Retained memory** | 513.3 MB | 163.0 MB | **163.0 MB** |
+| **Leaf lookup (50k)** | 108.2 ms | 77.7 ms | **78.8 ms** |
+
+| Comparison | Speedup |
+|---|---|
+| Cached vs fresh compact! | **15.7x faster** |
+| Cached vs Simple | **12.5x faster** |
+
+### Cache details
+
+| Property | Value |
+|---|---|
+| Cache file size | 147.3 MB |
+| Format | Marshal (magic + version + fingerprint + data) |
+| Invalidation (default) | File paths + mtimes (SHA256) |
+| Invalidation (opt-in) | File content digest (SHA256) |
+| Proc handling | Re-evaluates .rb locale files on cache load |
+
+### RSS improvement explained
+
+The cached path has significantly lower RSS (676 MB) than even the fresh compact path (1,128 MB) because it skips YAML parsing entirely. YAML parsing creates millions of transient Ruby objects that, even after GC, leave fragmented heap pages that the OS doesn't reclaim. By never creating those objects in the first place, the cached path avoids this fragmentation.
 
 ## Synthetic Benchmark (30 locales × 100 namespaces)
 
@@ -69,6 +99,6 @@ Subtree lookups (e.g., `I18n.t(:errors)` returning a Hash) are slower because th
 # Synthetic benchmark
 bundle exec ruby benchmark/memory.rb 30 100
 
-# Real Shopify files
+# Real Shopify files (includes cache measurement)
 bundle exec ruby benchmark/shopify_memory.rb /path/to/shopify
 ```

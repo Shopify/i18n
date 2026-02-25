@@ -438,3 +438,130 @@ keys = compact_result[:sample_keys] || simple_result[:sample_keys] || []
 keys.first(5).each { |locale, key| puts "    #{locale}: #{key}" }
 puts "    ..." if keys.size > 5
 puts
+
+# ========== Measure Compact Backend with Cache (in fork) ==========
+# First, build the cache file in a separate fork.
+cache_path = "/tmp/i18n_compact_benchmark_#{Process.pid}.cache"
+
+puts "Building cache file..."
+$stdout.flush
+
+build_cache_result = measure_in_fork(locale_files) do |files|
+  compact_backend_class = Class.new(I18n::Backend::Simple) do
+    include I18n::Backend::Compact
+  end
+  backend = compact_backend_class.new
+  I18n.backend = backend
+
+  files.each { |f| I18n.load_path << f }
+  backend.eager_load!(cache_path: cache_path)
+
+  cache_size = File.exist?(cache_path) ? File.size(cache_path) : 0
+  { cache_size: cache_size }
+end
+
+puts "  Cache file: #{format_bytes(build_cache_result[:cache_size])}"
+puts
+
+# Now measure loading from cache in a fresh fork.
+puts "Measuring Compact backend (from cache)..."
+$stdout.flush
+
+cached_result = measure_in_fork(locale_files) do |files|
+  compact_backend_class = Class.new(I18n::Backend::Simple) do
+    include I18n::Backend::Compact
+  end
+  backend = compact_backend_class.new
+  I18n.backend = backend
+
+  load_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  files.each { |f| I18n.load_path << f }
+  backend.eager_load!(cache_path: cache_path)
+  load_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - load_start
+
+  GC.start(full_mark: true, immediate_sweep: true)
+  GC.start(full_mark: true, immediate_sweep: true)
+
+  # Measure components (same as compact measurement)
+  schema = backend.instance_variable_get(:@schema)
+  value_arrays = backend.instance_variable_get(:@value_arrays)
+  translations = backend.instance_variable_get(:@translations)
+  subtree_keys = backend.instance_variable_get(:@subtree_keys)
+  string_table = backend.instance_variable_get(:@string_table)
+  objects_table = backend.instance_variable_get(:@objects_table)
+
+  schema_stats = measure_retained(schema)
+  values_stats = measure_retained(value_arrays)
+  tree_stats = measure_retained(translations)
+  subtree_stats = subtree_keys ? measure_retained(subtree_keys) : { bytes: 0, objects: 0 }
+  string_table_bytes = string_table ? (ObjectSpace.memsize_of(string_table) rescue 0) : 0
+  objects_table_stats = objects_table ? measure_retained(objects_table) : { bytes: 0, objects: 0 }
+
+  total_bytes = schema_stats[:bytes] + values_stats[:bytes] + tree_stats[:bytes] +
+                subtree_stats[:bytes] + string_table_bytes + objects_table_stats[:bytes]
+
+  # Lookup benchmark
+  sample_keys = []
+  if schema.size > 0
+    first_locale = value_arrays.keys.first
+    schema.each do |sym_key, idx|
+      break if sample_keys.size >= 20
+      str_key = sym_key.to_s
+      next unless str_key.include?(".")
+      packed = value_arrays[first_locale]&.[](idx)
+      next if packed.nil? || packed == -(1 << 62)
+      sample_keys << [first_locale, str_key]
+    end
+  end
+
+  lookup_time = 0
+  if sample_keys.size > 0
+    sample_keys.each { |locale, key| backend.translate(locale, key) rescue nil }
+    lookup_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    50_000.times do
+      locale, key = sample_keys[0]
+      backend.translate(locale, key) rescue nil
+    end
+    lookup_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - lookup_start
+  end
+
+  {
+    retained_bytes: total_bytes,
+    load_time: load_time,
+    lookup_time: lookup_time,
+    num_locales: value_arrays.size,
+  }
+end
+
+# Clean up cache file.
+File.delete(cache_path) if File.exist?(cache_path)
+
+puts
+puts "-" * 70
+puts "Simple + Compact Backend (from cache)"
+puts "-" * 70
+puts "  RSS delta:        #{format_bytes(cached_result[:rss_delta])}"
+puts "  Retained memory:  #{format_bytes(cached_result[:retained_bytes])}"
+puts "  Locales:          #{cached_result[:num_locales]}"
+puts "  Load time:        #{'%.2f' % cached_result[:load_time]} s (from cache)"
+puts "  Lookup (50k):     #{'%.1f' % (cached_result[:lookup_time] * 1000)} ms"
+puts "  Cache file:       #{format_bytes(build_cache_result[:cache_size])}"
+
+cache_speedup = compact_result[:load_time] > 0 && cached_result[:load_time] > 0 ?
+  compact_result[:load_time] / cached_result[:load_time] : 0
+total_speedup = simple_result[:load_time] > 0 && cached_result[:load_time] > 0 ?
+  simple_result[:load_time] / cached_result[:load_time] : 0
+
+puts
+puts "=" * 70
+puts "Cache Comparison"
+puts "=" * 70
+puts
+puts "  Load time:  Simple #{'%.2f' % simple_result[:load_time]} s -> Compact #{'%.2f' % compact_result[:load_time]} s -> Cached #{'%.2f' % cached_result[:load_time]} s"
+if cache_speedup > 0
+  puts "  Speedup vs fresh compact!: #{'%.1f' % cache_speedup}x faster"
+end
+if total_speedup > 0
+  puts "  Speedup vs Simple:         #{'%.1f' % total_speedup}x faster"
+end
+puts

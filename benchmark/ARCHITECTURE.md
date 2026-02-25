@@ -245,37 +245,112 @@ I18n.t("activemodel.errors", locale: :en)
                     │   (Simple mode)      │
                     └──────────┬──────────┘
                                │
-                    load_path / store_translations
+                eager_load!(cache_path: "...")
                                │
-                               ▼
-                    ┌─────────────────────┐
-                    │  Nested Hash tree   │
-                    │  (@translations)    │◄──────────────────┐
-                    └──────────┬──────────┘                   │
-                               │                              │
-                      eager_load! / compact!         rebuild_nested_tree!
-                               │                    (per-locale, on demand)
-                               ▼                              │
-                    ┌─────────────────────┐                   │
-                    │   Compacted mode    │                   │
-                    │   (columnar index)  │───────────────────┘
-                    └──────────┬──────────┘   store_translations
-                               │              (decompacts one locale)
-                        reload!│
-                               ▼
-                    ┌─────────────────────┐
-                    │  All state cleared  │
-                    │  (back to start)    │
-                    └─────────────────────┘
+                  ┌────────────┴────────────┐
+                  │ compute fingerprint     │
+                  │ from load_path files    │
+                  └────────────┬────────────┘
+                               │
+                ┌──────────────┴──────────────┐
+                │  Cache file exists           │
+                │  and fingerprint matches?    │
+                └──────┬──────────────┬───────┘
+                  yes  │              │  no
+                       ▼              ▼
+          ┌──────────────────┐  ┌──────────────────┐
+          │  Marshal.load    │  │  load_translations│
+          │  cache file      │  │  (parse all YAML) │
+          │                  │  └────────┬─────────┘
+          │  Rebuild procs   │           │
+          │  from .rb files  │      compact!
+          └────────┬─────────┘           │
+                   │              ┌──────┴──────┐
+                   │              │ dump_cache  │
+                   │              │ to file     │
+                   │              └──────┬──────┘
+                   │                     │
+                   └──────────┬──────────┘
+                              ▼
+                   ┌─────────────────────┐
+                   │   Compacted mode    │
+                   │   (columnar index)  │◄─────────────────┐
+                   └──────────┬──────────┘                  │
+                              │                             │
+                    store_translations          rebuild_nested_tree!
+                   (decompacts one locale)     (per-locale, on demand)
+                              │                             │
+                              ├─────────────────────────────┘
+                              │
+                       reload!│
+                              ▼
+                   ┌─────────────────────┐
+                   │  All state cleared  │
+                   │  (back to start)    │
+                   └─────────────────────┘
 ```
 
 ### Key behaviors
 
-- **`eager_load!`** calls `super` (loads all YAML files), then `compact!`
-- **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged)
-- **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted
-- **`reload!`** clears all compacted state and resets to uninitialized
-- **`lookup`** checks `@compacted_locales` to decide whether to use the fast columnar path or fall through to the Simple backend's nested Hash traversal
+- **`eager_load!(cache_path: "...")`** computes a fingerprint from load_path files, then attempts to load the cache. On cache hit, YAML parsing is skipped entirely (the main performance win). On cache miss, it falls through to `super` (load all YAML), then `compact!`, then writes the cache.
+- **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged). Also accepts `cache_path:` for the same caching behavior.
+- **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted.
+- **`reload!`** clears all compacted state and resets to uninitialized.
+- **`lookup`** checks `@compacted_locales` to decide whether to use the fast columnar path or fall through to the Simple backend's nested Hash traversal.
+
+## Caching
+
+The compacted representation can be serialized to a cache file so that subsequent boots skip YAML parsing and compaction entirely:
+
+```ruby
+I18n.backend.eager_load!(cache_path: "/tmp/i18n_compact.cache")
+```
+
+### Cache file format
+
+The cache is a single `Marshal.dump`'d Array:
+
+```
+[ MAGIC, VERSION, fingerprint, schema, value_arrays, string_table,
+  objects_table, subtree_keys, proc_positions ]
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `MAGIC` | String | `"I18NC"` — identifies the file format |
+| `VERSION` | Integer | `1` — bumped on incompatible format changes |
+| `fingerprint` | String | SHA256 hex digest for cache invalidation |
+| `schema` | Hash | `{ Symbol => Integer }` — shared key index |
+| `value_arrays` | Hash | `{ Symbol => Array }` — per-locale packed integer arrays |
+| `string_table` | String | Binary buffer of concatenated translation strings |
+| `objects_table` | Array | Non-string values (with Procs replaced by placeholders) |
+| `subtree_keys` | Hash | `{ Symbol => Array<Symbol> }` — parent→children index |
+| `proc_positions` | Hash | `{ Integer => [[locale, key], ...] }` — where Procs were |
+
+### Cache invalidation
+
+Two modes, selected via the `cache_digest:` option:
+
+**Mtime-based (default):** Hashes sorted file paths + their `File.mtime` values. Fast to compute (~ms), but won't survive mtime resets (e.g., `git checkout`, `rsync --archive`).
+
+```ruby
+I18n.backend.eager_load!(cache_path: path)
+```
+
+**Content-based:** Hashes sorted file paths + `File.read` contents via SHA256. Slower to compute (reads all files) but robust across deploys.
+
+```ruby
+I18n.backend.eager_load!(cache_path: path, cache_digest: true)
+```
+
+### Proc handling
+
+Proc values (primarily pluralization rules from `.rb` locale files) cannot be serialized with Marshal. The cache system handles this by:
+
+1. **On write:** Replacing each Proc in the objects table with a `PROC_PLACEHOLDER` marker and recording its position + associated schema keys in `proc_positions`.
+2. **On load:** Re-evaluating all `.rb` files from `I18n.load_path`, extracting Procs by flattening the returned hashes, and patching them back into the objects table at the recorded positions.
+
+This means `.rb` locale files are always re-evaluated on cache load (they're typically small — e.g., pluralization rules), while the expensive YAML parsing (261 MB across 15K files) is skipped entirely.
 
 ## Memory Model
 
@@ -308,10 +383,11 @@ The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-spe
 
 | File | Purpose |
 |---|---|
-| `lib/i18n/backend/compact.rb` | Implementation (module, ~465 lines) |
+| `lib/i18n/backend/compact.rb` | Implementation (module, ~600 lines) |
 | `lib/i18n/backend.rb` | `autoload :Compact` entry |
-| `test/backend/compact_test.rb` | Unit tests (25 tests) |
+| `test/backend/compact_test.rb` | Unit tests (36 tests, including cache tests) |
 | `test/api/compact_test.rb` | API integration tests (143 tests, all standard I18n::Tests modules) |
 | `benchmark/memory.rb` | Synthetic memory benchmark |
-| `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark |
+| `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark (includes cache) |
 | `benchmark/RESULTS.md` | Benchmark results |
+| `benchmark/ARCHITECTURE.md` | This document |

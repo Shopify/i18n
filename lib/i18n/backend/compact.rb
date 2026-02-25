@@ -45,6 +45,25 @@
 # affected locale (reverting it to nested Hash mode) until `compact!` is
 # called again.
 #
+# == Caching
+#
+# The compacted representation can be serialized to a cache file so that
+# subsequent boots skip YAML parsing and compaction entirely:
+#
+#   I18n.backend.eager_load!(cache_path: "/tmp/i18n_compact.cache")
+#
+# Or with content-based cache invalidation (slower to compute but survives
+# mtime resets during deploys):
+#
+#   I18n.backend.eager_load!(cache_path: "/tmp/i18n_compact.cache", cache_digest: true)
+#
+# The cache is invalidated automatically when the set of load_path files or
+# their contents/mtimes change.
+#
+# Proc values (e.g., pluralization rules from .rb locale files) cannot be
+# serialized. When loading from cache, .rb locale files are re-evaluated to
+# reconstruct any Proc values.
+#
 # == Trade-offs
 #
 # * Leaf lookups (the common case) are O(1) — schema hash lookup + array
@@ -60,9 +79,29 @@ module I18n
   module Backend
     module Compact
       # Trigger compaction after eager loading.
-      def eager_load!
-        super
-        compact!
+      #
+      # Options:
+      #   cache_path:   Path to a cache file. If present and valid, the
+      #                 compacted index is loaded from it instead of rebuilding.
+      #                 If absent or stale, the index is rebuilt and written.
+      #   cache_digest: When true, use SHA256 content digests for cache
+      #                 invalidation instead of file mtimes. Slower to compute
+      #                 but survives mtime resets (e.g., during deploys).
+      def eager_load!(cache_path: nil, cache_digest: false)
+        # When a cache path is provided, try to load directly from cache
+        # BEFORE parsing any YAML files. This skips the expensive
+        # load_translations step entirely on cache hit.
+        if cache_path
+          fingerprint = compute_fingerprint(digest: cache_digest)
+          if load_cache(cache_path, fingerprint)
+            @initialized = true
+            return
+          end
+        end
+
+        super()
+        compact!(cache_path: cache_path, cache_digest: cache_digest,
+                 _fingerprint: fingerprint)
       end
 
       # Compact all loaded translations into an optimized columnar structure
@@ -70,7 +109,11 @@ module I18n
       #
       # This should be called after all translations have been loaded (e.g.,
       # after `eager_load!` in production).
-      def compact!
+      #
+      # Options:
+      #   cache_path:   Path to a cache file (see eager_load!).
+      #   cache_digest: Use content digests for invalidation (see eager_load!).
+      def compact!(cache_path: nil, cache_digest: false, _fingerprint: nil)
         init_translations unless initialized?
 
         @compacted_locales ||= {}
@@ -83,6 +126,14 @@ module I18n
 
         # Nothing to do if all locales are already compacted.
         return if !has_pending
+
+        # Try loading from cache if a path was provided.
+        if cache_path
+          fingerprint = _fingerprint || compute_fingerprint(digest: cache_digest)
+          if load_cache(cache_path, fingerprint)
+            return
+          end
+        end
 
         # If some locales are already compacted and we have new locales to add,
         # rebuild everything from scratch. This is simpler than remapping
@@ -118,6 +169,12 @@ module I18n
 
         # Build the subtree key sets for efficient subtree reconstruction.
         build_subtree_index!
+
+        # Write cache for next boot.
+        if cache_path
+          fingerprint ||= compute_fingerprint(digest: cache_digest)
+          dump_cache(cache_path, fingerprint)
+        end
       end
 
       def store_translations(locale, data, options = EMPTY_HASH)
@@ -459,6 +516,200 @@ module I18n
         end
 
         translations[locale] = nested
+      end
+
+      # ================================================================
+      # Cache serialization
+      # ================================================================
+
+      # Magic bytes and version for the cache file format.
+      CACHE_MAGIC   = "I18NC"
+      CACHE_VERSION = 1
+
+      # Compute a fingerprint of all load_path files for cache invalidation.
+      #
+      # When digest: false (default), uses file paths + mtimes. This is fast
+      # but won't survive mtime resets (e.g., git checkout, rsync, deploy).
+      #
+      # When digest: true, uses SHA256 of file contents. Slower but robust
+      # across deploys.
+      def compute_fingerprint(digest: false)
+        files = I18n.load_path.flatten.sort
+        if digest
+          require 'digest/sha2'
+          d = Digest::SHA256.new
+          files.each do |f|
+            d.update(f)
+            d.update("\0")
+            d.update(File.read(f)) if File.exist?(f)
+            d.update("\0")
+          end
+          d.hexdigest
+        else
+          # path:mtime pairs — fast to compute, sufficient when mtimes are stable.
+          parts = files.map do |f|
+            mtime = File.exist?(f) ? File.mtime(f).to_i.to_s : "0"
+            "#{f}:#{mtime}"
+          end
+          require 'digest/sha2'
+          Digest::SHA256.hexdigest(parts.join("\n"))
+        end
+      end
+
+      # Placeholder marker stored in the objects table in place of Proc values,
+      # which cannot be marshaled. The schema key is stored so that Procs can
+      # be re-injected after loading from cache.
+      PROC_PLACEHOLDER = :__i18n_compact_proc_placeholder__
+
+      # Attempt to load the compacted index from a cache file.
+      # Returns true if the cache was loaded successfully, false otherwise.
+      def load_cache(path, fingerprint)
+        return false unless File.exist?(path)
+
+        data = File.binread(path)
+        magic, version, cached_fingerprint, schema_data, value_arrays_data,
+          string_table_data, objects_data, subtree_keys_data, proc_positions_data =
+          Marshal.load(data)
+
+        return false unless magic == CACHE_MAGIC
+        return false unless version == CACHE_VERSION
+        return false unless cached_fingerprint == fingerprint
+
+        @schema = schema_data
+        @schema_index = @schema.size
+        @value_arrays = value_arrays_data
+        @string_table = string_table_data.freeze
+        @objects_table = objects_data
+        @subtree_keys = subtree_keys_data
+
+        @compacted_locales = {}
+        @value_arrays.each_key { |locale| @compacted_locales[locale] = true }
+
+        # Replace marker hashes in @translations so available_locales works.
+        @value_arrays.each_key do |locale|
+          translations[locale] = build_locale_marker
+        end
+
+        # Rebuild Proc values from .rb locale files.
+        proc_positions = proc_positions_data || {}
+        rebuild_procs!(proc_positions) if proc_positions.any?
+
+        @objects_table.freeze
+        true
+      rescue ArgumentError, TypeError, NoMethodError, Encoding::CompatibilityError
+        # Corrupt or incompatible cache — fall through to fresh compaction.
+        false
+      end
+
+      # Write the compacted index to a cache file.
+      def dump_cache(path, fingerprint)
+        # Replace Proc values in the objects table with placeholders,
+        # recording their positions so they can be rebuilt on load.
+        # We work on a copy to avoid mutating the live table.
+        proc_positions = {} # { objects_table_index => schema_key }
+        serializable_objects = @objects_table.dup
+
+        # Build a reverse map: for each objects_table index that holds a Proc,
+        # find the schema key(s) that reference it.
+        obj_idx_to_keys = {}
+        @schema.each do |sym_key, schema_idx|
+          @value_arrays.each do |locale, values|
+            packed = values[schema_idx]
+            next if packed.nil?
+            if object_ref?(packed)
+              oi = -(packed + 1)
+              (obj_idx_to_keys[oi] ||= []) << [locale, sym_key]
+            end
+          end
+        end
+
+        serializable_objects.each_with_index do |obj, idx|
+          if obj.is_a?(Proc)
+            proc_positions[idx] = obj_idx_to_keys[idx] || []
+            serializable_objects[idx] = PROC_PLACEHOLDER
+          end
+        end
+
+        payload = Marshal.dump([
+          CACHE_MAGIC,
+          CACHE_VERSION,
+          fingerprint,
+          @schema,
+          @value_arrays,
+          @string_table,
+          serializable_objects,
+          @subtree_keys,
+          proc_positions,
+        ])
+
+        # Atomic write: write to a temp file then rename, to avoid
+        # serving a partially-written cache file to concurrent readers.
+        tmp_path = "#{path}.#{Process.pid}.tmp"
+        File.binwrite(tmp_path, payload)
+        File.rename(tmp_path, path)
+      rescue Errno::ENOENT, Errno::EACCES, Errno::EROFS => e
+        # Can't write cache (read-only filesystem, bad path, etc.) — that's OK,
+        # just skip caching silently. The backend still works without it.
+        File.delete(tmp_path) if tmp_path && File.exist?(tmp_path)
+      end
+
+      # Rebuild Proc values by re-loading .rb locale files and injecting
+      # their Proc values back into the objects table.
+      #
+      # proc_positions is a Hash of { objects_table_index => [[locale, schema_key], ...] }
+      # that tells us which positions in @objects_table originally held Procs
+      # and which translation keys they belonged to.
+      def rebuild_procs!(proc_positions)
+        return if proc_positions.empty?
+
+        # Find .rb files in the load path.
+        rb_files = I18n.load_path.flatten.select { |f| f.end_with?(".rb") }
+        return if rb_files.empty?
+
+        # Load each .rb file and extract Procs by flattening the returned hash.
+        rb_procs = {} # { [locale, flat_key_sym] => proc_value }
+        rb_files.each do |filename|
+          begin
+            data = eval(IO.read(filename), binding, filename.to_s) # rubocop:disable Security/Eval
+            next unless data.is_a?(Hash)
+
+            data.each do |locale, tree|
+              locale = locale.to_sym
+              extract_procs(nil, tree, locale, rb_procs) if tree.is_a?(Hash)
+            end
+          rescue => e
+            # Skip files that fail to load — they may have been removed since
+            # the cache was written.
+            next
+          end
+        end
+
+        # Make objects_table mutable for patching.
+        @objects_table = @objects_table.dup if @objects_table.frozen?
+
+        proc_positions.each do |obj_idx, key_pairs|
+          # Try to find a matching Proc from the re-loaded .rb files.
+          key_pairs.each do |locale, sym_key|
+            proc_val = rb_procs[[locale, sym_key]]
+            if proc_val
+              @objects_table[obj_idx] = proc_val
+              break
+            end
+          end
+        end
+      end
+
+      # Recursively extract Proc values from a nested hash into a flat map.
+      def extract_procs(prefix, hash, locale, result)
+        hash.each do |key, value|
+          flat_key = prefix ? :"#{prefix}.#{key}" : key.to_s.to_sym
+          case value
+          when Hash
+            extract_procs(flat_key, value, locale, result)
+          when Proc
+            result[[locale, flat_key]] = value
+          end
+        end
       end
     end
   end
