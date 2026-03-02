@@ -650,6 +650,10 @@ module I18n
           proc_positions,
         ])
 
+        # Ensure the parent directory exists.
+        require 'fileutils'
+        FileUtils.mkdir_p(File.dirname(@compact_cache_path))
+
         # Atomic write: write to a temp file then rename, to avoid
         # serving a partially-written compact cache file to concurrent readers.
         tmp_path = "#{@compact_cache_path}.#{Process.pid}.tmp"

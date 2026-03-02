@@ -367,6 +367,22 @@ class I18nBackendCompactTest < I18n::TestCase
 
   # Cache does not crash on missing/corrupt file
 
+  test "cache: creates parent directories for compact cache file" do
+    require 'tmpdir'
+    dir = File.join(Dir.tmpdir, "i18n_compact_test_#{Process.pid}", "nested")
+    path = File.join(dir, "test.cache")
+    begin
+      store_translations(:en, :test => 'val')
+      I18n.backend.configure_compact_cache(path: path)
+      I18n.backend.compact!
+
+      assert File.exist?(path), "Compact cache file should be created"
+      assert_equal 'val', I18n.t(:test)
+    ensure
+      FileUtils.rm_rf(File.join(Dir.tmpdir, "i18n_compact_test_#{Process.pid}"))
+    end
+  end
+
   test "cache: handles missing compact cache file gracefully" do
     store_translations(:en, :test => 'val')
     I18n.backend.configure_compact_cache(path: '/tmp/nonexistent_i18n_cache_file_that_does_not_exist.cache')
