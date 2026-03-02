@@ -81,22 +81,22 @@ After all translations are loaded, `compact!` transforms the nested tree into fi
                                               │ ... (all strings concatenated)   │
                                               └──────────────────────────────────┘
 
-                                              @objects_table (shared Array)
-                                              ┌──────────────────────────────────┐
-                                              │ [<Array>, <Symbol>, <Proc>, ...] │
-                                              └──────────────────────────────────┘
+                                               @objects_table (shared Array)
+                                               ┌──────────────────────────────────┐
+                                               │ [<Array>, <Symbol>, <Proc>, ...] │
+                                               └──────────────────────────────────┘
 
-                                              @subtree_keys (parent → children index)
-                                              ┌──────────────────────────────────────┐
-                                              │ :"activemodel" =>                    │
-                                              │   [:"activemodel.errors"]            │
-                                              │ :"activemodel.errors" =>             │
-                                              │   [:"activemodel.errors.models"]     │
-                                              │ ...                                  │
-                                              └──────────────────────────────────────┘
+                                               @subtree_keys (parent → children index)
+                                               ┌──────────────────────────────────────┐
+                                               │ :"activemodel" =>                    │
+                                               │   [:"activemodel.errors"]            │
+                                               │ :"activemodel.errors" =>             │
+                                               │   [:"activemodel.errors.models"]     │
+                                               │ ...                                  │
+                                               └──────────────────────────────────────┘
 
-                                              569K objects
-                                              163 MB retained
+                                               569K objects
+                                               163 MB retained
 ```
 
 ## Data Structures

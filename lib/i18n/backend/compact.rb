@@ -160,7 +160,6 @@ module I18n
 
         # Finalize the string table into a single frozen binary buffer.
         @string_table = @_string_builder.to_buffer
-        @string_table_encodings = @_string_builder.encodings
         @objects_table = @_objects_builder.freeze
 
         # Clean up builders — they're no longer needed.
@@ -196,7 +195,6 @@ module I18n
         @compacted_locales = nil
         @subtree_keys = nil
         @string_table = nil
-        @string_table_encodings = nil
         @objects_table = nil
         @_string_builder = nil
         @_objects_builder = nil
@@ -239,18 +237,23 @@ module I18n
 
       # Helper class to build the binary string table during compaction.
       # Deduplicates identical strings so each unique string is stored once.
+      #
+      # US-ASCII strings are normalized to UTF-8 for dedup purposes since
+      # US-ASCII is a strict subset of UTF-8 with identical byte representation.
+      # This avoids storing the same bytes twice under different encoding tags.
       class StringTableBuilder
         def initialize
           @buffer = String.new(encoding: Encoding::BINARY, capacity: 4096)
-          @index = {}  # content_hash => [offset, length, encoding_id]
-          @encodings = []  # parallel to @buffer positions: maps offset => encoding_id
-          @encoding_map = {}  # offset => encoding_id
+          @index = {}  # [bytes, encoding_id] => [offset, length, encoding_id]
         end
 
         # Add a string to the table, returning [offset, length, encoding_id].
-        # Deduplicates by content + encoding.
+        # Deduplicates by byte content + encoding.
         def add(str)
-          enc_id = encoding_id(str.encoding)
+          # Normalize US-ASCII to UTF-8 — identical bytes, saves dedup space.
+          enc = str.encoding
+          enc_id = encoding_id(enc)
+
           key = [str, enc_id]
           existing = @index[key]
           return existing if existing
@@ -258,7 +261,6 @@ module I18n
           offset = @buffer.bytesize
           length = str.bytesize
           @buffer << str.b  # append as binary
-          @encoding_map[offset] = enc_id
 
           entry = [offset, length, enc_id].freeze
           @index[key] = entry
@@ -270,18 +272,13 @@ module I18n
           @buffer.freeze
         end
 
-        # Return the encoding map (offset => encoding_id).
-        def encodings
-          @encoding_map.freeze
-        end
-
         private
 
         def encoding_id(encoding)
           case encoding
-          when Encoding::UTF_8    then ENCODING_UTF8
-          when Encoding::US_ASCII then ENCODING_ASCII
-          when Encoding::BINARY   then ENCODING_BINARY
+          # Normalize US-ASCII → UTF-8 (identical byte representation).
+          when Encoding::UTF_8, Encoding::US_ASCII then ENCODING_UTF8
+          when Encoding::BINARY                    then ENCODING_BINARY
           else ENCODING_OTHER
           end
         end
@@ -647,7 +644,7 @@ module I18n
         tmp_path = "#{path}.#{Process.pid}.tmp"
         File.binwrite(tmp_path, payload)
         File.rename(tmp_path, path)
-      rescue Errno::ENOENT, Errno::EACCES, Errno::EROFS => e
+      rescue Errno::ENOENT, Errno::EACCES, Errno::EROFS
         # Can't write cache (read-only filesystem, bad path, etc.) — that's OK,
         # just skip caching silently. The backend still works without it.
         File.delete(tmp_path) if tmp_path && File.exist?(tmp_path)
@@ -677,7 +674,7 @@ module I18n
               locale = locale.to_sym
               extract_procs(nil, tree, locale, rb_procs) if tree.is_a?(Hash)
             end
-          rescue => e
+          rescue
             # Skip files that fail to load — they may have been removed since
             # the cache was written.
             next
