@@ -55,7 +55,7 @@ Benchmark comparing `I18n::Backend::Simple` vs `I18n::Backend::Simple` + `I18n::
 
 ## Cache Performance (Real Shopify Files)
 
-When a cache file is provided via `eager_load!(cache_path: "...")`, the compacted index is serialized to disk after the first boot. On subsequent boots, the cache is loaded directly — skipping all YAML parsing and compaction.
+When a compact cache is configured via `configure_compact_cache(path: "...")`, the compacted index is serialized to disk after the first boot. On subsequent boots, the compact cache is loaded directly — skipping all YAML parsing and compaction.
 
 | Metric | Simple | Compact (fresh) | Compact (cached) |
 |---|---|---|---|

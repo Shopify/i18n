@@ -45,24 +45,27 @@
 # affected locale (reverting it to nested Hash mode) until `compact!` is
 # called again.
 #
-# == Caching
+# == Compact Cache
 #
-# The compacted representation can be serialized to a cache file so that
-# subsequent boots skip YAML parsing and compaction entirely:
+# The compacted representation can be serialized to a compact cache file
+# so that subsequent boots skip YAML parsing and compaction entirely.
+# Configure the compact cache before calling eager_load!:
 #
-#   I18n.backend.eager_load!(cache_path: "/tmp/i18n_compact.cache")
+#   I18n.backend.configure_compact_cache(path: "/tmp/i18n_compact.cache")
+#   I18n.backend.eager_load!
 #
 # Or with content-based cache invalidation (slower to compute but survives
 # mtime resets during deploys):
 #
-#   I18n.backend.eager_load!(cache_path: "/tmp/i18n_compact.cache", cache_digest: true)
+#   I18n.backend.configure_compact_cache(path: "/tmp/i18n_compact.cache", digest: true)
+#   I18n.backend.eager_load!
 #
-# The cache is invalidated automatically when the set of load_path files or
-# their contents/mtimes change.
+# The compact cache is invalidated automatically when the set of load_path
+# files or their contents/mtimes change.
 #
 # Proc values (e.g., pluralization rules from .rb locale files) cannot be
-# serialized. When loading from cache, .rb locale files are re-evaluated to
-# reconstruct any Proc values.
+# serialized. When loading from the compact cache, .rb locale files are
+# re-evaluated to reconstruct any Proc values.
 #
 # == Trade-offs
 #
@@ -78,42 +81,48 @@
 module I18n
   module Backend
     module Compact
-      # Trigger compaction after eager loading.
+      # Configure the compact cache. When a path is configured, eager_load!
+      # and compact! will attempt to load the compacted index from the cache
+      # file (skipping YAML parsing entirely on cache hit), and will write
+      # the cache file after compaction on cache miss.
       #
       # Options:
-      #   cache_path:   Path to a cache file. If present and valid, the
-      #                 compacted index is loaded from it instead of rebuilding.
-      #                 If absent or stale, the index is rebuilt and written.
-      #   cache_digest: When true, use SHA256 content digests for cache
-      #                 invalidation instead of file mtimes. Slower to compute
-      #                 but survives mtime resets (e.g., during deploys).
-      def eager_load!(cache_path: nil, cache_digest: false)
-        # When a cache path is provided, try to load directly from cache
-        # BEFORE parsing any YAML files. This skips the expensive
+      #   path:   Path to a compact cache file.
+      #   digest: When true, use SHA256 content digests for cache
+      #           invalidation instead of file mtimes. Slower to compute
+      #           but survives mtime resets (e.g., during deploys).
+      #           Defaults to false.
+      def configure_compact_cache(path:, digest: false)
+        @compact_cache_path = path
+        @compact_cache_digest = digest
+      end
+
+      # Trigger compaction after eager loading. If a compact cache has been
+      # configured via configure_compact_cache, it will be used to skip
+      # YAML parsing on cache hit.
+      def eager_load!
+        # When a compact cache is configured, try to load directly from
+        # cache BEFORE parsing any YAML files. This skips the expensive
         # load_translations step entirely on cache hit.
-        if cache_path
-          fingerprint = compute_fingerprint(digest: cache_digest)
-          if load_cache(cache_path, fingerprint)
+        if @compact_cache_path
+          fingerprint = compute_compact_cache_fingerprint
+          if load_compact_cache(fingerprint)
             @initialized = true
             return
           end
         end
 
         super()
-        compact!(cache_path: cache_path, cache_digest: cache_digest,
-                 _fingerprint: fingerprint)
+        compact!(_fingerprint: fingerprint)
       end
 
       # Compact all loaded translations into an optimized columnar structure
       # backed by a binary string table.
       #
       # This should be called after all translations have been loaded (e.g.,
-      # after `eager_load!` in production).
-      #
-      # Options:
-      #   cache_path:   Path to a cache file (see eager_load!).
-      #   cache_digest: Use content digests for invalidation (see eager_load!).
-      def compact!(cache_path: nil, cache_digest: false, _fingerprint: nil)
+      # after `eager_load!` in production). If a compact cache has been
+      # configured via configure_compact_cache, it will be used.
+      def compact!(_fingerprint: nil)
         init_translations unless initialized?
 
         @compacted_locales ||= {}
@@ -127,10 +136,10 @@ module I18n
         # Nothing to do if all locales are already compacted.
         return if !has_pending
 
-        # Try loading from cache if a path was provided.
-        if cache_path
-          fingerprint = _fingerprint || compute_fingerprint(digest: cache_digest)
-          if load_cache(cache_path, fingerprint)
+        # Try loading from compact cache if configured.
+        if @compact_cache_path
+          fingerprint = _fingerprint || compute_compact_cache_fingerprint
+          if load_compact_cache(fingerprint)
             return
           end
         end
@@ -169,10 +178,10 @@ module I18n
         # Build the subtree key sets for efficient subtree reconstruction.
         build_subtree_index!
 
-        # Write cache for next boot.
-        if cache_path
-          fingerprint ||= compute_fingerprint(digest: cache_digest)
-          dump_cache(cache_path, fingerprint)
+        # Write compact cache for next boot.
+        if @compact_cache_path
+          fingerprint ||= compute_compact_cache_fingerprint
+          dump_compact_cache(fingerprint)
         end
       end
 
@@ -523,16 +532,18 @@ module I18n
       CACHE_MAGIC   = "I18NC"
       CACHE_VERSION = 1
 
-      # Compute a fingerprint of all load_path files for cache invalidation.
+      # Compute a fingerprint of all load_path files for compact cache
+      # invalidation.
       #
-      # When digest: false (default), uses file paths + mtimes. This is fast
-      # but won't survive mtime resets (e.g., git checkout, rsync, deploy).
+      # When @compact_cache_digest is false (default), uses file paths +
+      # mtimes. This is fast but won't survive mtime resets (e.g., git
+      # checkout, rsync, deploy).
       #
-      # When digest: true, uses SHA256 of file contents. Slower but robust
-      # across deploys.
-      def compute_fingerprint(digest: false)
+      # When @compact_cache_digest is true, uses SHA256 of file contents.
+      # Slower but robust across deploys.
+      def compute_compact_cache_fingerprint
         files = I18n.load_path.flatten.sort
-        if digest
+        if @compact_cache_digest
           require 'digest/sha2'
           d = Digest::SHA256.new
           files.each do |f|
@@ -558,12 +569,12 @@ module I18n
       # be re-injected after loading from cache.
       PROC_PLACEHOLDER = :__i18n_compact_proc_placeholder__
 
-      # Attempt to load the compacted index from a cache file.
-      # Returns true if the cache was loaded successfully, false otherwise.
-      def load_cache(path, fingerprint)
-        return false unless File.exist?(path)
+      # Attempt to load the compacted index from the compact cache file.
+      # Returns true if the compact cache was loaded successfully, false otherwise.
+      def load_compact_cache(fingerprint)
+        return false unless @compact_cache_path && File.exist?(@compact_cache_path)
 
-        data = File.binread(path)
+        data = File.binread(@compact_cache_path)
         magic, version, cached_fingerprint, schema_data, value_arrays_data,
           string_table_data, objects_data, subtree_keys_data, proc_positions_data =
           Marshal.load(data)
@@ -598,8 +609,8 @@ module I18n
         false
       end
 
-      # Write the compacted index to a cache file.
-      def dump_cache(path, fingerprint)
+      # Write the compacted index to the compact cache file.
+      def dump_compact_cache(fingerprint)
         # Replace Proc values in the objects table with placeholders,
         # recording their positions so they can be rebuilt on load.
         # We work on a copy to avoid mutating the live table.
@@ -640,10 +651,10 @@ module I18n
         ])
 
         # Atomic write: write to a temp file then rename, to avoid
-        # serving a partially-written cache file to concurrent readers.
-        tmp_path = "#{path}.#{Process.pid}.tmp"
+        # serving a partially-written compact cache file to concurrent readers.
+        tmp_path = "#{@compact_cache_path}.#{Process.pid}.tmp"
         File.binwrite(tmp_path, payload)
-        File.rename(tmp_path, path)
+        File.rename(tmp_path, @compact_cache_path)
       rescue Errno::ENOENT, Errno::EACCES, Errno::EROFS
         # Can't write cache (read-only filesystem, bad path, etc.) — that's OK,
         # just skip caching silently. The backend still works without it.

@@ -454,7 +454,8 @@ build_cache_result = measure_in_fork(locale_files) do |files|
   I18n.backend = backend
 
   files.each { |f| I18n.load_path << f }
-  backend.eager_load!(cache_path: cache_path)
+  backend.configure_compact_cache(path: cache_path)
+  backend.eager_load!
 
   cache_size = File.exist?(cache_path) ? File.size(cache_path) : 0
   { cache_size: cache_size }
@@ -476,7 +477,8 @@ cached_result = measure_in_fork(locale_files) do |files|
 
   load_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   files.each { |f| I18n.load_path << f }
-  backend.eager_load!(cache_path: cache_path)
+  backend.configure_compact_cache(path: cache_path)
+  backend.eager_load!
   load_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - load_start
 
   GC.start(full_mark: true, immediate_sweep: true)

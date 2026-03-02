@@ -245,7 +245,8 @@ I18n.t("activemodel.errors", locale: :en)
                     │   (Simple mode)      │
                     └──────────┬──────────┘
                                │
-                eager_load!(cache_path: "...")
+       configure_compact_cache(path: "...")
+                     eager_load!
                                │
                   ┌────────────┴────────────┐
                   │ compute fingerprint     │
@@ -292,18 +293,20 @@ I18n.t("activemodel.errors", locale: :en)
 
 ### Key behaviors
 
-- **`eager_load!(cache_path: "...")`** computes a fingerprint from load_path files, then attempts to load the cache. On cache hit, YAML parsing is skipped entirely (the main performance win). On cache miss, it falls through to `super` (load all YAML), then `compact!`, then writes the cache.
-- **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged). Also accepts `cache_path:` for the same caching behavior.
+- **`configure_compact_cache(path: "...", digest: false)`** configures the compact cache. When configured, `eager_load!` and `compact!` will use the cache file to skip YAML parsing on cache hit, and write the cache on cache miss. The `digest:` option controls cache invalidation: `false` (default) uses file mtimes, `true` uses SHA256 content digests.
+- **`eager_load!`** computes a fingerprint from load_path files, then attempts to load from the compact cache (if configured). On cache hit, YAML parsing is skipped entirely (the main performance win). On cache miss, it falls through to `super` (load all YAML), then `compact!`, then writes the compact cache.
+- **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged).
 - **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted.
 - **`reload!`** clears all compacted state and resets to uninitialized.
 - **`lookup`** checks `@compacted_locales` to decide whether to use the fast columnar path or fall through to the Simple backend's nested Hash traversal.
 
 ## Caching
 
-The compacted representation can be serialized to a cache file so that subsequent boots skip YAML parsing and compaction entirely:
+The compacted representation can be serialized to a compact cache file so that subsequent boots skip YAML parsing and compaction entirely:
 
 ```ruby
-I18n.backend.eager_load!(cache_path: "/tmp/i18n_compact.cache")
+I18n.backend.configure_compact_cache(path: "/tmp/i18n_compact.cache")
+I18n.backend.eager_load!
 ```
 
 ### Cache file format
@@ -334,13 +337,15 @@ Two modes, selected via the `cache_digest:` option:
 **Mtime-based (default):** Hashes sorted file paths + their `File.mtime` values. Fast to compute (~ms), but won't survive mtime resets (e.g., `git checkout`, `rsync --archive`).
 
 ```ruby
-I18n.backend.eager_load!(cache_path: path)
+I18n.backend.configure_compact_cache(path: path)
+I18n.backend.eager_load!
 ```
 
 **Content-based:** Hashes sorted file paths + `File.read` contents via SHA256. Slower to compute (reads all files) but robust across deploys.
 
 ```ruby
-I18n.backend.eager_load!(cache_path: path, cache_digest: true)
+I18n.backend.configure_compact_cache(path: path, digest: true)
+I18n.backend.eager_load!
 ```
 
 ### Proc handling
