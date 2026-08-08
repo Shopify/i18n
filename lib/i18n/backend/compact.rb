@@ -17,16 +17,24 @@
 #    bytes of per-object overhead in Ruby), replacing them with one large
 #    contiguous allocation.
 #
-# 3. **Integer-packed value arrays**: Each locale's values are stored in a flat
-#    Array containing only immediate-value Integers (zero heap overhead), nil,
-#    or a sentinel marker. String translations are encoded as packed integers:
+# 3. **Sparse integer-packed value stores**: Each locale's values are keyed by
+#    the shared schema index and hold only immediate-value Integers, nil, or a
+#    sentinel marker. String translations are encoded as packed integers:
 #    `(offset << 16) | length`, where offset and length index into the binary
 #    string table. Non-string values (Arrays, Symbols, Procs, etc.) are stored
 #    in a shared side table and referenced by negative integers.
 #
+#    The store is keyed rather than positional because the schema is shared: a
+#    positional Array is sized by the union of every locale's keys and nil-padded
+#    for each key a locale does not define. On Shopify Core (813 locales over a
+#    199,138-key schema, ~4% dense) that padding cost 1.15 GB of Array buffer for
+#    6.7M real entries — more than the nested Hash tree it replaced, so
+#    compaction made Core's footprint worse rather than better.
+#
 # 4. **Reduced object count**: The deeply nested Hash tree (thousands of
 #    intermediate Hash objects and String objects) is replaced with a single
-#    schema Hash + one Array per locale + one binary buffer + one side table.
+#    schema Hash + one value store per locale + one binary buffer + one side
+#    table.
 #
 # To enable it, include the Compact module in your backend:
 #
@@ -348,7 +356,7 @@ module I18n
         @value_arrays ||= {}
         @compacted_locales ||= {}
 
-        values = []
+        values = {}
         flatten_into_columns(nil, tree, values)
 
         @value_arrays[locale] = values.freeze

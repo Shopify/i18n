@@ -30,6 +30,20 @@ class I18nBackendCompactTest < I18n::TestCase
     assert_equal 'baz', I18n.t('foo.bar')
   end
 
+  test "compact!: value stores are sparse, not positional over the shared schema" do
+    store_translations(:en, :shared => "s", :only_en => "e")
+    store_translations(:fr, :shared => "s")
+    I18n.backend.compact!
+
+    stores = I18n.backend.instance_variable_get(:@value_arrays)
+    schema = I18n.backend.instance_variable_get(:@schema)
+
+    # A positional store would be sized by the union of every locale's keys.
+    assert stores.values.none? { |store| store.is_a?(Array) }
+    assert stores[:fr].size < schema.size
+    assert_equal "s", I18n.t(:shared, :locale => :fr)
+  end
+
   test "compact!: string values are deduplicated" do
     store_translations(:en, :dedup_a => "hello world")
     store_translations(:en, :dedup_b => "hello world")
