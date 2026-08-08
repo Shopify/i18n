@@ -16,7 +16,7 @@ module I18n
   autoload :Tests,   'i18n/tests'
   autoload :Middleware,   'i18n/middleware'
 
-  RESERVED_KEYS = %i[
+  @reserved_keys = %i[
     cascade
     deep_interpolation
     skip_interpolation
@@ -32,11 +32,17 @@ module I18n
     scope
     separator
     throw
-  ]
+  ].freeze
   EMPTY_HASH = {}.freeze
 
   def self.new_double_nested_cache # :nodoc:
     Concurrent::Map.new { |h, k| h[k] = Concurrent::Map.new }
+  end
+
+  # Returns the current set of reserved keys. Reserved keys are used
+  # internally, and can't also be used for interpolation.
+  def self.reserved_keys
+    @reserved_keys
   end
 
   # Marks a key as reserved. Reserved keys are used internally,
@@ -44,13 +50,17 @@ module I18n
   # extra keys as I18n options, you should call I18n.reserve_key
   # before any I18n.translate (etc) calls are made.
   def self.reserve_key(key)
-    RESERVED_KEYS << key.to_sym
+    @reserved_keys = (@reserved_keys + [key.to_sym]).freeze
     @reserved_keys_pattern = nil
   end
 
   def self.reserved_keys_pattern # :nodoc:
-    @reserved_keys_pattern ||= /(?<!%)%\{(#{RESERVED_KEYS.join("|")})\}/
+    @reserved_keys_pattern ||= /(?<!%)%\{(#{@reserved_keys.join("|")})\}/
   end
+  @reserved_keys_pattern = reserved_keys_pattern
+
+  RESERVED_KEYS = @reserved_keys
+  deprecate_constant :RESERVED_KEYS
 
   module Base
     # Gets I18n configuration object.
