@@ -31,7 +31,13 @@
 #    6.7M real entries — more than the nested Hash tree it replaced, so
 #    compaction made Core's footprint worse rather than better.
 #
-# 4. **Reduced object count**: The deeply nested Hash tree (thousands of
+# 4. **Base-locale deltas**: A locale stores only the values that differ from
+#    the base locale's, plus a presence bitmap over the schema. Core measured
+#    38.8% of entries as byte-identical to the base. The bitmap keeps "same as
+#    base" distinguishable from "not defined here", so this never invents a
+#    fallback where the application has none.
+#
+# 5. **Reduced object count**: The deeply nested Hash tree (thousands of
 #    intermediate Hash objects and String objects) is replaced with a single
 #    schema Hash + one value store per locale + one binary buffer + one side
 #    table.
@@ -186,6 +192,9 @@ module I18n
         # Build the subtree key sets for efficient subtree reconstruction.
         build_subtree_index!
 
+        # Keep only the values that differ from the base locale's.
+        apply_base_delta!
+
         # Write compact cache for next boot.
         if @compact_cache_path
           fingerprint ||= compute_compact_cache_fingerprint
@@ -211,12 +220,17 @@ module I18n
         @value_arrays = nil
         @compacted_locales = nil
         @subtree_keys = nil
+        @delta_stats = nil
         @string_table = nil
         @objects_table = nil
         @_string_builder = nil
         @_objects_builder = nil
         super
       end
+
+      # Entries elided because they matched the base locale, and the totals
+      # behind that: { base:, total:, inherited: }. nil before compaction.
+      attr_reader :delta_stats
 
       protected
 
@@ -238,6 +252,45 @@ module I18n
       # We use a specific large negative number that won't collide with
       # object table references (which are -(index+1), starting at -1).
       SUBTREE_SENTINEL = -(1 << 62)
+
+      # A locale's value store: the values that differ from the base locale's,
+      # plus a presence bitmap over the schema.
+      #
+      # Most of the footprint is the per-(locale, key) index rather than the
+      # values themselves, and a large share of values are byte-identical to the
+      # base locale's. Shopify Core measured 2,597,977 of 6,688,165 entries
+      # (38.8%) as identical.
+      #
+      # The bitmap is what keeps this honest. Without it, "same as base" and "not
+      # defined for this locale" become indistinguishable, which would invent a
+      # base-locale fallback for applications that deliberately have none.
+      # Responds to #[] so every read site treats it like the Hash it replaces.
+      class DeltaStore
+        attr_reader :overrides, :inherited_count
+
+        def initialize(bits, overrides, base, inherited_count)
+          @bits = bits
+          @overrides = overrides
+          @base = base
+          @inherited_count = inherited_count
+        end
+
+        def [](schema_index)
+          return nil if schema_index.nil?
+
+          byte = @bits.getbyte(schema_index >> 3)
+          return nil if byte.nil? || (byte & (1 << (schema_index & 7))).zero?
+
+          value = @overrides[schema_index]
+          return value unless value.nil?
+
+          @base[schema_index]
+        end
+
+        def size
+          @overrides.size + @inherited_count
+        end
+      end
 
       # Encoding IDs for the string table. We store encoding as a small
       # integer to avoid per-string Encoding object references.
@@ -349,6 +402,56 @@ module I18n
         value.equal?(SUBTREE_SENTINEL)
       end
 
+      # Replace every non-base locale's store with a presence bitmap plus only
+      # the values that differ from the base locale's.
+      def apply_base_delta!
+        stores = @value_arrays
+        return if stores.nil? || stores.empty?
+
+        # Only the base locale keeps a plain Hash, so "some store is a Hash"
+        # stays true after a successful pass. compact! runs again on every
+        # eager_load!, and a second pass would convert nothing while still
+        # overwriting the recorded stats.
+        return if stores.each_value.any? { |store| store.is_a?(DeltaStore) }
+        return unless stores.each_value.any? { |store| store.is_a?(Hash) }
+
+        base_locale = I18n.default_locale&.to_sym
+        base = stores[base_locale]
+        total = stores.each_value.sum(&:size)
+
+        unless base.is_a?(Hash)
+          @delta_stats = { base: nil, total: total, inherited: 0 }
+          return
+        end
+
+        bitmap_bytes = (@schema.size / 8) + 1
+        inherited = 0
+
+        stores.each do |locale, store|
+          next if locale == base_locale
+          next unless store.is_a?(Hash)
+
+          bits = String.new("\0" * bitmap_bytes, encoding: Encoding::BINARY)
+          overrides = {}
+          local_inherited = 0
+
+          store.each do |idx, packed|
+            byte_index = idx >> 3
+            bits.setbyte(byte_index, (bits.getbyte(byte_index) || 0) | (1 << (idx & 7)))
+            if base[idx] == packed
+              local_inherited += 1
+            else
+              overrides[idx] = packed
+            end
+          end
+
+          inherited += local_inherited
+          stores[locale] = DeltaStore.new(bits.freeze, overrides.freeze, base, local_inherited).freeze
+        end
+
+        @delta_stats = { base: base_locale, total: total, inherited: inherited }
+      end
+
       # Compact a single locale's translation tree into the columnar structure.
       def compact_locale!(locale, tree)
         @schema ||= {}
@@ -359,7 +462,7 @@ module I18n
         values = {}
         flatten_into_columns(nil, tree, values)
 
-        @value_arrays[locale] = values.freeze
+        @value_arrays[locale] = values
         @compacted_locales[locale] = true
 
         # Clear the nested tree for this locale to free memory.

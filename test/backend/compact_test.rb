@@ -44,6 +44,51 @@ class I18nBackendCompactTest < I18n::TestCase
     assert_equal "s", I18n.t(:shared, :locale => :fr)
   end
 
+  test "compact!: stores only values that differ from the base locale" do
+    store_translations(:en, :same => "SAME", :differs => "en", :only_en => "e")
+    store_translations(:fr, :same => "SAME", :differs => "fr")
+    I18n.backend.compact!
+
+    stores = I18n.backend.instance_variable_get(:@value_arrays)
+    assert stores[:fr].is_a?(I18n::Backend::Compact::DeltaStore)
+    assert_equal 1, I18n.backend.delta_stats[:inherited]
+    assert_equal 1, stores[:fr].overrides.size
+
+    assert_equal "SAME", I18n.t(:same, :locale => :fr)
+    assert_equal "fr", I18n.t(:differs, :locale => :fr)
+  end
+
+  test "compact!: a base value is not inherited by a locale that omits the key" do
+    store_translations(:en, :only_en => "en only")
+    store_translations(:fr, :other => "autre")
+    I18n.backend.compact!
+
+    assert_equal "Translation missing: fr.only_en", I18n.t(:only_en, :locale => :fr)
+  end
+
+  test "compact!: delta stats survive a second eager_load!" do
+    store_translations(:en, :same => "SAME")
+    store_translations(:fr, :same => "SAME")
+    I18n.backend.compact!
+    before = I18n.backend.delta_stats[:inherited]
+
+    I18n.backend.eager_load!
+
+    assert_equal before, I18n.backend.delta_stats[:inherited]
+  end
+
+  test "compact!: a delta locale still decompacts to a full tree" do
+    store_translations(:en, :same => "SAME", :differs => "en")
+    store_translations(:fr, :same => "SAME", :differs => "fr")
+    I18n.backend.compact!
+
+    store_translations(:fr, :added => "ajoute")
+
+    assert_equal "ajoute", I18n.t(:added, :locale => :fr)
+    assert_equal "SAME", I18n.t(:same, :locale => :fr)
+    assert_equal "fr", I18n.t(:differs, :locale => :fr)
+  end
+
   test "compact!: string values are deduplicated" do
     store_translations(:en, :dedup_a => "hello world")
     store_translations(:en, :dedup_b => "hello world")
