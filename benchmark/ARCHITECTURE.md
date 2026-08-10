@@ -61,16 +61,16 @@ After all translations are loaded, `compact!` transforms the nested tree into fi
   │           blank: "..."   │                │ ...                                 │
   │ fr:                      │                └─────────────────────────────────────┘
   │   activemodel:           │
-  │     errors:              │                @value_arrays (one per locale)
+  │     errors:              │                @value_arrays (one store per locale)
   │       ...                │                ┌──────────────────────────────────┐
-  │         invalid: "..."   │                │ en: [ SUBTREE, SUBTREE, SUBTREE, │
-  │         blank: "..."     │                │       SUBTREE, 0x00000440000E,   │
-  │ de:                      │                │       0x00001D0000F, ... ]        │
-  │   ...                    │                │ fr: [ SUBTREE, SUBTREE, SUBTREE, │
-  └──────────────────────────┘                │       SUBTREE, 0x00004C000012,   │
-                                              │       0x000062000011, ... ]       │
-  3.3M objects                                │ de: [ ... ]                       │
-  513 MB retained                             └──────────────────────────────────┘
+  │         invalid: "..."   │                │ en: { 0 => SUBTREE, 1 => SUBTREE,│
+  │         blank: "..."     │                │       4 => 0x00000440000E,       │
+  │ de:                      │                │       5 => 0x00001D0000F, ... }  │
+  │   ...                    │                │ fr: DeltaStore(bits, {           │
+  └──────────────────────────┘                │       4 => 0x00004C000012 })     │
+                                              │ de: DeltaStore(bits, { ... })    │
+  3.3M objects                                └──────────────────────────────────┘
+  513 MB retained
                                                      │               │
                                                      │  decode       │  decode
                                                      ▼               ▼
@@ -121,26 +121,49 @@ A single `Hash` mapping flattened dot-separated Symbol keys to integer indices. 
 
 In the Shopify codebase: **157,079 keys**.
 
-### 2. `@value_arrays` — Per-Locale Value Arrays
+### 2. `@value_arrays` — Per-Locale Value Stores
 
-A `Hash` of `{ locale => Array }`. Each Array is indexed by the schema positions and contains only:
+A `Hash` of `{ locale => store }`. Each store is keyed by the schema index and holds only:
 
 - **Positive integers** — packed string table references
 - **Negative integers** — object table references (`-(index + 1)`)
 - **`SUBTREE_SENTINEL`** (`-(1 << 62)`) — marks subtree nodes
-- **`nil`** — key doesn't exist in this locale
+- **An absent key** — the key does not exist in this locale
 
 ```ruby
 {
-  en: [SUBTREE_SENTINEL, SUBTREE_SENTINEL, ..., 0x00000440000E, ...],
-  fr: [SUBTREE_SENTINEL, SUBTREE_SENTINEL, ..., 0x00004C000012, ...],
+  en: { 0 => SUBTREE_SENTINEL, 1 => SUBTREE_SENTINEL, 6 => 0x00000440000E, ... },
+  fr: #<DeltaStore bits=..., overrides={ 6 => 0x00004C000012, ... }>,
   # ...
 }
 ```
 
-Ruby integers up to 2^62 are **immediate values** — they consume zero heap memory when stored in an Array. This makes the value arrays essentially free in terms of object overhead; only the Array shell itself is allocated.
+The store is keyed rather than positional because the schema is shared. A positional Array is sized by the union of every locale's keys, and it holds a `nil` for each key that the locale does not define. Shopify Core is about 4% dense: 813 locales over a 199,138-key schema cost 1.15 GB of Array buffer for 6.7M real entries. That padding is larger than the nested Hash tree that compaction removes.
 
-### 3. `@string_table` — Binary String Buffer
+Ruby integers up to 2^62 are **immediate values** — they consume zero heap memory. Only the store itself is allocated.
+
+The base locale keeps a plain `Hash`. Every other locale holds a `DeltaStore`.
+
+### 3. `DeltaStore` — Base-Locale Delta
+
+Most of the remaining footprint is the per-(locale, key) index, not the values, and many values are byte-identical to the base locale's. Shopify Core measured 2,597,977 of 6,688,165 entries (38.8%) as identical, worth 117 MB.
+
+A non-base locale therefore stores two things:
+
+- **`@bits`** — a presence bitmap over the schema, one bit per schema index
+- **`@overrides`** — a `Hash` of only the schema indices whose value differs from the base locale's
+
+`DeltaStore#[]` reads the bit first:
+
+- The bit is clear: the locale does not define the key, so the result is `nil`.
+- The bit is set and an override exists: the result is the override.
+- The bit is set and no override exists: the result is the base locale's value.
+
+The bitmap is load-bearing, not an optimisation. Without it, "same as base" and "not defined here" collapse into the same absence, and an untranslated key resolves to the base value. That is wrong for an application whose fallback chain excludes the base locale. Shopify Core sets `config.i18n.fallbacks = [nil]` and raises on a missing translation.
+
+`apply_base_delta!` runs at the end of `compact!`. It returns early once any store is a `DeltaStore`, because `compact!` runs again on every `eager_load!`. The public `delta_stats` reader reports `{ base:, total:, inherited: }`.
+
+### 4. `@string_table` — Binary String Buffer
 
 A single frozen `String` with `Encoding::BINARY` containing all unique translation strings concatenated end-to-end. Strings are deduplicated during building — identical content with the same encoding is stored once.
 
@@ -154,13 +177,13 @@ Offset 0          68            150           ...
 
 In the Shopify codebase: **90.6 MB**, holding 1,490,916 unique strings serving 2,774,778 references (1.9x dedup ratio).
 
-### 4. `@objects_table` — Non-String Value Array
+### 5. `@objects_table` — Non-String Value Array
 
-A shared frozen `Array` holding all non-string leaf values: Arrays (e.g., day names), Symbols (link targets), Procs, booleans, numbers. Referenced from value arrays by negative index.
+A shared frozen `Array` holding all non-string leaf values: Arrays (e.g., day names), Symbols (link targets), Procs, booleans, numbers. Referenced from the value stores by negative index.
 
 In the Shopify codebase: only **308 entries**. Nearly all translations are strings.
 
-### 5. `@subtree_keys` — Subtree Children Index
+### 6. `@subtree_keys` — Subtree Children Index
 
 A frozen `Hash` mapping each parent key to its direct children's schema keys. Used only for subtree reconstruction when `I18n.t(:some_namespace)` returns a Hash.
 
@@ -207,8 +230,8 @@ I18n.t("activemodel.errors.models.user.attributes.email.invalid", locale: :en)
 ├─ 2. Schema lookup: @schema[:"activemodel...email.invalid"] → idx 6
 │     (one Hash lookup)
 │
-├─ 3. Value array lookup: @value_arrays[:en][6] → 0x00000440000E
-│     (one Array index)
+├─ 3. Value store lookup: @value_arrays[:en][6] → 0x00000440000E
+│     (one Hash lookup, or a bitmap test plus one Hash lookup)
 │
 ├─ 4. Detect positive integer → string reference
 │
@@ -299,6 +322,7 @@ I18n.t("activemodel.errors", locale: :en)
 - **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted.
 - **`reload!`** clears all compacted state and resets to uninitialized.
 - **`lookup`** checks `@compacted_locales` to decide whether to use the fast columnar path or fall through to the Simple backend's nested Hash traversal.
+- **`delta_stats`** reports how many entries `apply_base_delta!` elided. It is `nil` before compaction.
 
 ## Caching
 
@@ -324,7 +348,7 @@ The cache is a single `Marshal.dump`'d Array:
 | `VERSION` | Integer | `1` — bumped on incompatible format changes |
 | `fingerprint` | String | SHA256 hex digest for cache invalidation |
 | `schema` | Hash | `{ Symbol => Integer }` — shared key index |
-| `value_arrays` | Hash | `{ Symbol => Array }` — per-locale packed integer arrays |
+| `value_arrays` | Hash | `{ Symbol => Hash \| DeltaStore }` — per-locale packed integer stores |
 | `string_table` | String | Binary buffer of concatenated translation strings |
 | `objects_table` | Array | Non-string values (with Procs replaced by placeholders) |
 | `subtree_keys` | Hash | `{ Symbol => Array<Symbol> }` — parent→children index |
@@ -372,15 +396,17 @@ Simple backend (per-locale, per intermediate key):
 Compact backend:
 ┌────────────────────────────────────────────────────────────────┐
 │  @schema:        1 Hash (14 MB for 157K symbol→int pairs)     │
-│  @value_arrays:  42 Arrays of integers (47 MB total)          │
+│  @value_arrays:  42 value stores of integers (47 MB total)    │
 │                  (integers are immediate values — 0 bytes each │
-│                   on the heap; only the Array backing store)   │
+│                   on the heap; only the store itself)         │
 │  @string_table:  1 String (90.6 MB, one contiguous buffer)    │
 │  @objects_table: 1 Array (308 entries, 139 KB)                │
 │  @subtree_keys:  1 Hash (10.9 MB for parent→children map)    │
 │  Total: 163 MB                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
+
+The `@value_arrays` figure above comes from the 42-locale Shopify benchmark, which ran before the sparse-store and base-locale delta changes.
 
 The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-specific backing storage) dominates when you have millions of small objects. Replacing 3.3 million objects with ~50 large ones eliminates most of this overhead.
 
@@ -390,7 +416,7 @@ The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-spe
 |---|---|
 | `lib/i18n/backend/compact.rb` | Implementation (module, ~600 lines) |
 | `lib/i18n/backend.rb` | `autoload :Compact` entry |
-| `test/backend/compact_test.rb` | Unit tests (36 tests, including cache tests) |
+| `test/backend/compact_test.rb` | Unit tests (42 tests, including cache tests) |
 | `test/api/compact_test.rb` | API integration tests (143 tests, all standard I18n::Tests modules) |
 | `benchmark/memory.rb` | Synthetic memory benchmark |
 | `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark (includes cache) |
