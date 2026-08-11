@@ -63,7 +63,7 @@
 #
 # The compacted representation can be serialized to a compact cache file
 # so that subsequent boots skip YAML parsing and compaction entirely.
-# Configure the compact cache before calling eager_load!:
+# Configure the compact cache before anything reads a translation:
 #
 #   I18n.backend.configure_compact_cache(path: "/tmp/i18n_compact.cache")
 #   I18n.backend.eager_load!
@@ -74,8 +74,17 @@
 #   I18n.backend.configure_compact_cache(path: "/tmp/i18n_compact.cache", digest: true)
 #   I18n.backend.eager_load!
 #
+# The cache is served from `init_translations`, not from `eager_load!`.
+# Backend::Simple calls `init_translations` from `lookup` and from
+# `available_locales`, so one `I18n.t` during boot parses the whole load path
+# before `eager_load!` is ever reached. Hooking the earlier method means the
+# cache serves whatever triggers the load, whenever that happens.
+#
 # The compact cache is invalidated automatically when the set of load_path
-# files or their contents/mtimes change.
+# files or their contents/mtimes change. A host that already computes a
+# load-path digest can supply it instead of paying for a second one:
+#
+#   I18n.backend.configure_compact_cache(path: path, fingerprint: -> { MyCache.digest })
 #
 # Proc values (e.g., pluralization rules from .rb locale files) cannot be
 # serialized. When loading from the compact cache, .rb locale files are
@@ -103,9 +112,10 @@
 #
 # == Trade-offs
 #
-# * Leaf lookups (the common case) are O(1) — schema hash lookup + array
-#   index + buffer slice. The buffer slice allocates a new String per lookup,
-#   similar to the existing `entry.dup` behavior in Backend::Base#translate.
+# * Leaf lookups (the common case) are O(1) — schema hash lookup + one read
+#   from the locale's value store + buffer slice. The buffer slice allocates a
+#   new String per lookup, similar to the existing `entry.dup` behavior in
+#   Backend::Base#translate.
 # * Subtree lookups (e.g., I18n.t(:errors) returning a whole Hash) require
 #   reconstructing the nested structure on demand. This is slower than the
 #   Simple backend but is an uncommon operation in production.
@@ -115,10 +125,10 @@
 module I18n
   module Backend
     module Compact
-      # Configure the compact cache. When a path is configured, eager_load!
-      # and compact! will attempt to load the compacted index from the cache
-      # file (skipping YAML parsing entirely on cache hit), and will write
-      # the cache file after compaction on cache miss.
+      # Configure the compact cache. When a path is configured, the backend
+      # loads the compacted index from the cache file the first time anything
+      # initializes translations, skipping YAML parsing entirely on a hit, and
+      # writes the cache file after compaction on a miss.
       #
       # Options:
       #   path:        Path to a compact cache file.
