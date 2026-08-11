@@ -81,6 +81,26 @@
 # serialized. When loading from the compact cache, .rb locale files are
 # re-evaluated to reconstruct any Proc values.
 #
+# == Cache serializers
+#
+# The cache payload is encoded with Marshal by default. Any object that
+# responds to #dump(object) and #load(payload) can replace it, which lets an
+# application use a faster or safer codec, such as Paquito:
+#
+#   codec = Paquito::CodecFactory.build([Symbol])
+#   I18n.backend.configure_compact_cache(path: path, serializer: codec)
+#
+# The payload holds only Hash, Array, String, Symbol, Integer and nil, plus
+# whatever non-string translation values the objects table carries, so a
+# serializer needs no knowledge of this backend's classes. In particular the
+# per-locale delta stores travel as plain data: they reference the base
+# locale's store, and only Marshal would restore that sharing on load, so the
+# backend re-shares one base store itself.
+#
+# The magic bytes and the format version sit in a plain header outside the
+# payload, so a cache written by a different serializer is rejected by the
+# header check instead of raising from inside the serializer.
+#
 # == Trade-offs
 #
 # * Leaf lookups (the common case) are O(1) — schema hash lookup + array
@@ -101,14 +121,22 @@ module I18n
       # the cache file after compaction on cache miss.
       #
       # Options:
-      #   path:   Path to a compact cache file.
-      #   digest: When true, use SHA256 content digests for cache
-      #           invalidation instead of file mtimes. Slower to compute
-      #           but survives mtime resets (e.g., during deploys).
-      #           Defaults to false.
-      def configure_compact_cache(path:, digest: false)
+      #   path:       Path to a compact cache file.
+      #   digest:     When true, use SHA256 content digests for cache
+      #               invalidation instead of file mtimes. Slower to compute
+      #               but survives mtime resets (e.g., during deploys).
+      #               Defaults to false.
+      #   serializer: Object responding to #dump(object) and #load(payload),
+      #               used to encode the cache payload. Defaults to Marshal.
+      #               See "Cache serializers" in the module documentation.
+      def configure_compact_cache(path:, digest: false, serializer: Marshal)
+        unless serializer.respond_to?(:dump) && serializer.respond_to?(:load)
+          raise ArgumentError, "compact cache serializer must respond to #dump and #load, got #{serializer.inspect}"
+        end
+
         @compact_cache_path = path
         @compact_cache_digest = digest
+        @compact_cache_serializer = serializer
       end
 
       # Trigger compaction after eager loading. If a compact cache has been
@@ -167,11 +195,14 @@ module I18n
           end
         end
 
-        # Reset the compacted state — we'll rebuild all locales.
-        @schema.clear
+        # Reset the compacted state — we'll rebuild all locales. These are
+        # reassigned rather than cleared because a cache load can hand back
+        # frozen containers: Paquito freezes its result when built with
+        # freeze: true, and clearing one of those raises.
+        @schema = {}
         @schema_index = 0
-        @value_arrays.clear
-        @compacted_locales.clear
+        @value_arrays = {}
+        @compacted_locales = {}
 
         # Build fresh string and object tables.
         @_string_builder = StringTableBuilder.new
@@ -266,7 +297,10 @@ module I18n
       # base-locale fallback for applications that deliberately have none.
       # Responds to #[] so every read site treats it like the Hash it replaces.
       class DeltaStore
-        attr_reader :overrides, :inherited_count
+        # bits and base are read by the cache serializer, which writes a delta
+        # store as plain data and re-shares one base store across every locale
+        # on load.
+        attr_reader :bits, :overrides, :base, :inherited_count
 
         def initialize(bits, overrides, base, inherited_count)
           @bits = bits
@@ -639,9 +673,26 @@ module I18n
       # Cache serialization
       # ================================================================
 
-      # Magic bytes and version for the cache file format.
+      # The cache file is framed with a plain header, written outside the
+      # serialized payload, so that the magic bytes and the format version can
+      # be checked before any byte reaches the serializer. A file written by a
+      # different serializer then fails the header check and is discarded,
+      # rather than raising from inside third-party parsing code.
       CACHE_MAGIC   = "I18NC"
       CACHE_VERSION = 1
+      CACHE_HEADER_FORMAT = "a5N"
+      CACHE_HEADER_SIZE = 9
+
+      # Tags for the serialized form of a locale's value store.
+      #
+      # A DeltaStore holds a reference to the base locale's store, and only
+      # Marshal restores that sharing on load. A serializer that copies instead
+      # (MessagePack, and so Paquito) would give every locale its own copy of
+      # the base store, which is exactly the memory the delta removes. The
+      # stores therefore travel as plain data, and load re-shares one base
+      # store across every delta locale.
+      STORE_PLAIN = 0
+      STORE_DELTA = 1
 
       # Compute a fingerprint of all load_path files for compact cache
       # invalidation.
@@ -680,44 +731,152 @@ module I18n
       # be re-injected after loading from cache.
       PROC_PLACEHOLDER = :__i18n_compact_proc_placeholder__
 
+      # The configured serializer, or Marshal when none was configured.
+      def compact_cache_serializer
+        @compact_cache_serializer || Marshal
+      end
+
       # Attempt to load the compacted index from the compact cache file.
       # Returns true if the compact cache was loaded successfully, false otherwise.
       def load_compact_cache(fingerprint)
         return false unless @compact_cache_path && File.exist?(@compact_cache_path)
 
-        data = File.binread(@compact_cache_path)
-        magic, version, cached_fingerprint, schema_data, value_arrays_data,
-          string_table_data, objects_data, subtree_keys_data, proc_positions_data =
-          Marshal.load(data)
+        payload = File.open(@compact_cache_path, "rb") do |file|
+          header = file.read(CACHE_HEADER_SIZE)
+          break nil unless header && header.bytesize == CACHE_HEADER_SIZE
 
-        return false unless magic == CACHE_MAGIC
-        return false unless version == CACHE_VERSION
-        return false unless cached_fingerprint == fingerprint
+          magic, version = header.unpack(CACHE_HEADER_FORMAT)
+          break nil unless magic == CACHE_MAGIC && version == CACHE_VERSION
 
-        @schema = schema_data
-        @schema_index = @schema.size
-        @value_arrays = value_arrays_data
-        @string_table = string_table_data.freeze
-        @objects_table = objects_data
-        @subtree_keys = subtree_keys_data
+          compact_cache_serializer.load(file.read)
+        end
+
+        return false unless payload.is_a?(Hash)
+        return false unless payload[:fingerprint] == fingerprint
+
+        # Validate and rebuild everything before assigning any state, so an
+        # unusable payload leaves the backend untouched and falls through to
+        # fresh compaction. A half-assigned backend would survive the rescue
+        # below and reach compact! as a mix of cached and live state.
+        schema         = payload[:schema]
+        string_table   = payload[:string_table]
+        objects_table  = payload[:objects_table]
+        subtree_keys   = payload[:subtree_keys]
+        proc_positions = payload[:proc_positions] || {}
+
+        return false unless schema.is_a?(Hash)
+        return false unless string_table.is_a?(String)
+        return false unless objects_table.is_a?(Array)
+        return false unless subtree_keys.is_a?(Hash)
+        return false unless proc_positions.is_a?(Hash)
+
+        value_arrays = restore_value_stores(payload[:value_stores], payload[:base_locale])
+        return false unless value_arrays
+
+        @schema = schema
+        @schema_index = schema.size
+        @value_arrays = value_arrays
+        @string_table = force_binary(string_table).freeze
+        @objects_table = objects_table
+        @subtree_keys = subtree_keys
+
+        # Rebuild Proc values from .rb locale files.
+        rebuild_procs!(proc_positions) if proc_positions.any?
+        @objects_table.freeze
 
         @compacted_locales = {}
         @value_arrays.each_key { |locale| @compacted_locales[locale] = true }
 
-        # Replace marker hashes in @translations so available_locales works.
+        # Last, because this is the one step that discards live state: the
+        # nested trees are replaced by markers so available_locales still sees
+        # every locale. Anything that raises above still leaves the real
+        # translations in place for the fresh compaction to use.
         @value_arrays.each_key do |locale|
           translations[locale] = build_locale_marker
         end
 
-        # Rebuild Proc values from .rb locale files.
-        proc_positions = proc_positions_data || {}
-        rebuild_procs!(proc_positions) if proc_positions.any?
-
-        @objects_table.freeze
         true
-      rescue ArgumentError, TypeError, NoMethodError, Encoding::CompatibilityError
+      rescue StandardError
         # Corrupt or incompatible cache — fall through to fresh compaction.
+        # The exception classes a serializer raises are its own, so this cannot
+        # enumerate them without coupling to one implementation.
         false
+      end
+
+      # Rebuild the per-locale stores from their plain serialized form, wiring
+      # every delta store to the one shared base store. Returns nil when the
+      # payload is inconsistent, which discards the cache.
+      def restore_value_stores(data, base_locale)
+        return nil unless data.is_a?(Hash)
+
+        stores = {}
+        base = nil
+
+        # The base store must exist before any delta store can reference it.
+        if base_locale
+          tag, plain = data[base_locale]
+          return nil unless tag == STORE_PLAIN
+
+          base = plain
+          stores[base_locale] = base
+        end
+
+        data.each do |locale, entry|
+          next if locale == base_locale
+
+          case entry[0]
+          when STORE_DELTA
+            return nil unless base
+
+            _tag, bits, overrides, inherited_count = entry
+            stores[locale] = DeltaStore.new(
+              force_binary(bits).freeze, overrides.freeze, base, inherited_count
+            ).freeze
+          when STORE_PLAIN
+            stores[locale] = entry[1]
+          else
+            return nil
+          end
+        end
+
+        stores
+      end
+
+      # The string table and the delta bitmaps are byte buffers. Marshal keeps
+      # their BINARY encoding, but a serializer only has to return the same
+      # bytes, so retag rather than trust the tag it came back with.
+      def force_binary(str)
+        return str if str.encoding == Encoding::BINARY
+
+        str = str.dup if str.frozen?
+        str.force_encoding(Encoding::BINARY)
+      end
+
+      # The locale whose store every delta store resolves through, found by
+      # identity so it holds regardless of what delta_stats recorded.
+      def delta_base_locale
+        delta = @value_arrays.each_value.find { |store| store.is_a?(DeltaStore) }
+        return nil unless delta
+
+        base = delta.base
+        @value_arrays.each { |locale, store| return locale if store.equal?(base) }
+        nil
+      end
+
+      # The per-locale stores as plain data: a Hash for the base locale, and
+      # [tag, bits, overrides, inherited_count] for every delta locale.
+      def serializable_value_stores
+        stores = {}
+
+        @value_arrays.each do |locale, store|
+          stores[locale] = if store.is_a?(DeltaStore)
+            [STORE_DELTA, store.bits, store.overrides, store.inherited_count]
+          else
+            [STORE_PLAIN, store]
+          end
+        end
+
+        stores
       end
 
       # Write the compacted index to the compact cache file.
@@ -749,17 +908,17 @@ module I18n
           end
         end
 
-        payload = Marshal.dump([
-          CACHE_MAGIC,
-          CACHE_VERSION,
-          fingerprint,
-          @schema,
-          @value_arrays,
-          @string_table,
-          serializable_objects,
-          @subtree_keys,
-          proc_positions,
-        ])
+        payload = {
+          :fingerprint    => fingerprint,
+          :schema         => @schema,
+          :base_locale    => delta_base_locale,
+          :value_stores   => serializable_value_stores,
+          :string_table   => @string_table,
+          :objects_table  => serializable_objects,
+          :subtree_keys   => @subtree_keys,
+          :proc_positions => proc_positions,
+        }
+        serialized = compact_cache_serializer.dump(payload)
 
         # Ensure the parent directory exists.
         require 'fileutils'
@@ -767,8 +926,13 @@ module I18n
 
         # Atomic write: write to a temp file then rename, to avoid
         # serving a partially-written compact cache file to concurrent readers.
+        # The header is written separately so that framing it costs no copy of
+        # the payload, which is the largest allocation in the process.
         tmp_path = "#{@compact_cache_path}.#{Process.pid}.tmp"
-        File.binwrite(tmp_path, payload)
+        File.open(tmp_path, "wb") do |file|
+          file.write([CACHE_MAGIC, CACHE_VERSION].pack(CACHE_HEADER_FORMAT))
+          file.write(serialized)
+        end
         File.rename(tmp_path, @compact_cache_path)
       rescue Errno::ENOENT, Errno::EACCES, Errno::EROFS
         # Can't write cache (read-only filesystem, bad path, etc.) — that's OK,

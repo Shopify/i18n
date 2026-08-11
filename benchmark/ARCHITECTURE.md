@@ -316,7 +316,7 @@ I18n.t("activemodel.errors", locale: :en)
 
 ### Key behaviors
 
-- **`configure_compact_cache(path: "...", digest: false)`** configures the compact cache. When configured, `eager_load!` and `compact!` will use the cache file to skip YAML parsing on cache hit, and write the cache on cache miss. The `digest:` option controls cache invalidation: `false` (default) uses file mtimes, `true` uses SHA256 content digests.
+- **`configure_compact_cache(path: "...", digest: false, serializer: Marshal)`** configures the compact cache. When configured, `eager_load!` and `compact!` will use the cache file to skip YAML parsing on cache hit, and write the cache on cache miss. The `digest:` option controls cache invalidation: `false` (default) uses file mtimes, `true` uses SHA256 content digests. The `serializer:` option replaces `Marshal`; it must respond to `dump` and `load`, and `configure_compact_cache` raises `ArgumentError` when it does not.
 - **`eager_load!`** computes a fingerprint from load_path files, then attempts to load from the compact cache (if configured). On cache hit, YAML parsing is skipped entirely (the main performance win). On cache miss, it falls through to `super` (load all YAML), then `compact!`, then writes the compact cache.
 - **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged).
 - **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted.
@@ -335,28 +335,59 @@ I18n.backend.eager_load!
 
 ### Cache file format
 
-The cache is a single `Marshal.dump`'d Array:
+The file is a plain header followed by one serialized payload:
 
 ```
-[ MAGIC, VERSION, fingerprint, schema, value_arrays, string_table,
-  objects_table, subtree_keys, proc_positions ]
+┌──────────────┬─────────────┬──────────────────────────────────────┐
+│ magic        │ version     │ payload                              │
+│ "I18NC"      │ uint32 BE   │ serializer.dump(Hash)                │
+│ 5 bytes      │ 4 bytes     │ rest of the file                     │
+└──────────────┴─────────────┴──────────────────────────────────────┘
 ```
 
-| Field | Type | Description |
+The header sits outside the payload so that the magic bytes and the version are checked before any byte reaches the serializer. A file written by a different serializer fails the header check and is discarded, instead of raising from inside third-party parsing code.
+
+The payload is a Hash:
+
+| Key | Type | Description |
 |---|---|---|
-| `MAGIC` | String | `"I18NC"` — identifies the file format |
-| `VERSION` | Integer | `1` — bumped on incompatible format changes |
-| `fingerprint` | String | SHA256 hex digest for cache invalidation |
-| `schema` | Hash | `{ Symbol => Integer }` — shared key index |
-| `value_arrays` | Hash | `{ Symbol => Hash \| DeltaStore }` — per-locale packed integer stores |
-| `string_table` | String | Binary buffer of concatenated translation strings |
-| `objects_table` | Array | Non-string values (with Procs replaced by placeholders) |
-| `subtree_keys` | Hash | `{ Symbol => Array<Symbol> }` — parent→children index |
-| `proc_positions` | Hash | `{ Integer => [[locale, key], ...] }` — where Procs were |
+| `:fingerprint` | String | SHA256 hex digest for cache invalidation |
+| `:schema` | Hash | `{ Symbol => Integer }` — shared key index |
+| `:base_locale` | Symbol | The locale every delta store resolves through, or `nil` |
+| `:value_stores` | Hash | `{ Symbol => Array }` — one tagged store per locale |
+| `:string_table` | String | Binary buffer of concatenated translation strings |
+| `:objects_table` | Array | Non-string values (with Procs replaced by placeholders) |
+| `:subtree_keys` | Hash | `{ Symbol => Array<Symbol> }` — parent→children index |
+| `:proc_positions` | Hash | `{ Integer => [[locale, key], ...] }` — where Procs were |
+
+Each entry in `:value_stores` is tagged, so a store travels as plain data rather than as an object:
+
+```ruby
+[0, { schema_index => packed, ... }]                  # a plain Hash store
+[1, bits, { schema_index => packed, ... }, inherited] # a DeltaStore
+```
+
+### Serializers
+
+`Marshal` is the default. Any object responding to `dump(object)` and `load(payload)` can replace it, which is the interface a Paquito codec already has:
+
+```ruby
+codec = Paquito::CodecFactory.build([Symbol])
+I18n.backend.configure_compact_cache(path: path, serializer: codec)
+```
+
+The payload holds only `Hash`, `Array`, `String`, `Symbol`, `Integer` and `nil`, plus whatever non-string translation values the objects table carries. A serializer therefore needs no knowledge of this backend's classes.
+
+Tagging the stores is what makes that true, and it is also a correctness requirement rather than a tidiness one. A `DeltaStore` references the base locale's store, and `Marshal` is the only serializer here that restores such sharing on load. MessagePack, and so Paquito, writes a copy at each reference, which would give all 813 locales their own copy of the base store — exactly the memory the delta removes. The backend therefore writes the base store once and re-shares it across every delta locale on load.
+
+Two further properties keep an arbitrary serializer safe:
+
+- **A frozen result is allowed.** `Paquito::CodecFactory.build(types, freeze: true)` returns frozen containers, so `compact!` reassigns `@schema`, `@value_arrays` and `@compacted_locales` when it rebuilds instead of clearing them in place.
+- **A failed load changes nothing.** `load_compact_cache` validates every field and rebuilds the stores before it assigns any state, and it replaces the nested trees with locale markers last. A rejected or malformed payload therefore leaves the live translations in place for the fresh compaction, and any exception the serializer raises becomes a plain cache miss.
 
 ### Cache invalidation
 
-Two modes, selected via the `cache_digest:` option:
+Two modes, selected via the `digest:` option:
 
 **Mtime-based (default):** Hashes sorted file paths + their `File.mtime` values. Fast to compute (~ms), but won't survive mtime resets (e.g., `git checkout`, `rsync --archive`).
 
@@ -416,7 +447,7 @@ The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-spe
 |---|---|
 | `lib/i18n/backend/compact.rb` | Implementation (module, ~600 lines) |
 | `lib/i18n/backend.rb` | `autoload :Compact` entry |
-| `test/backend/compact_test.rb` | Unit tests (42 tests, including cache tests) |
+| `test/backend/compact_test.rb` | Unit tests (52 tests, including cache and serializer tests) |
 | `test/api/compact_test.rb` | API integration tests (143 tests, all standard I18n::Tests modules) |
 | `benchmark/memory.rb` | Synthetic memory benchmark |
 | `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark (includes cache) |

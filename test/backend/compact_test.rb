@@ -525,4 +525,301 @@ class I18nBackendCompactTest < I18n::TestCase
       assert I18n.available_locales.include?(:fr)
     end
   end
+
+  # Pluggable cache serializers
+
+  # Stands in for a MessagePack-style codec such as Paquito. It refuses any
+  # class outside the primitive set, and it copies rather than preserving
+  # object identity. Marshal hides both properties, so only a serializer like
+  # this can show that the payload is portable.
+  module PortableSerializer
+    PRIMITIVES = [Hash, Array, String, Symbol, Integer, Float, TrueClass, FalseClass, NilClass].freeze
+
+    class << self
+      attr_accessor :dumps, :loads
+    end
+
+    def self.reset
+      self.dumps = 0
+      self.loads = 0
+    end
+
+    def self.dump(object)
+      self.dumps += 1
+      Marshal.dump(copy(object))
+    end
+
+    def self.load(payload)
+      self.loads += 1
+      Marshal.load(payload)
+    end
+
+    # Rebuilds every container and String, so no two references in the result
+    # point at one object. This is what MessagePack does, and it is why the
+    # backend cannot rely on Marshal to re-share the base store.
+    def self.copy(object)
+      case object
+      when Hash then object.each_with_object({}) { |(k, v), out| out[copy(k)] = copy(v) }
+      when Array then object.map { |item| copy(item) }
+      when String then object.dup
+      when Symbol, Integer, Float, TrueClass, FalseClass, NilClass then object
+      else raise TypeError, "cannot serialize #{object.class}"
+      end
+    end
+  end
+
+  test "configure_compact_cache: rejects a serializer without dump and load" do
+    assert_raises(ArgumentError) do
+      I18n.backend.configure_compact_cache(:path => "/tmp/i18n_unused.cache", :serializer => Object.new)
+    end
+  end
+
+  test "cache: a custom serializer encodes and decodes the payload" do
+    with_cache_file do |path|
+      PortableSerializer.reset
+      store_translations(:en, :greeting => "Hello")
+      store_translations(:fr, :greeting => "Bonjour")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => PortableSerializer)
+      I18n.backend.compact!
+
+      assert_equal 1, PortableSerializer.dumps
+      assert_equal 0, PortableSerializer.loads
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :greeting => "Hello")
+      store_translations(:fr, :greeting => "Bonjour")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => PortableSerializer)
+      I18n.backend.compact!
+
+      assert_equal 1, PortableSerializer.loads
+      assert_equal "Hello", I18n.t(:greeting, :locale => :en)
+      assert_equal "Bonjour", I18n.t(:greeting, :locale => :fr)
+    end
+  end
+
+  test "cache: the payload carries no backend objects" do
+    with_cache_file do |path|
+      PortableSerializer.reset
+      store_translations(:en, :same => "SAME", :differs => "en", :colors => %w(red green))
+      store_translations(:fr, :same => "SAME", :differs => "fr")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => PortableSerializer)
+
+      # A DeltaStore reaches the serializer unless the stores are written as
+      # plain data, and PortableSerializer raises on any such class.
+      I18n.backend.compact!
+
+      assert_operator File.size(path), :>, 0
+    end
+  end
+
+  test "cache: every delta locale resolves through one shared base store" do
+    with_cache_file do |path|
+      PortableSerializer.reset
+      %w(fr de).each_with_index do |locale, index|
+        store_translations(locale.to_sym, :same => "SAME", :differs => "v#{index}")
+      end
+      store_translations(:en, :same => "SAME", :differs => "en")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => PortableSerializer)
+      I18n.backend.compact!
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :same => "SAME", :differs => "en")
+      %w(fr de).each_with_index do |locale, index|
+        store_translations(locale.to_sym, :same => "SAME", :differs => "v#{index}")
+      end
+      I18n.backend.configure_compact_cache(:path => path, :serializer => PortableSerializer)
+      I18n.backend.compact!
+
+      stores = I18n.backend.instance_variable_get(:@value_arrays)
+      base = stores[:en]
+      assert_instance_of Hash, base
+
+      # The serializer copied the base store away; the backend re-shares it.
+      assert stores[:fr].base.equal?(base), "fr should resolve through the base store"
+      assert stores[:de].base.equal?(base), "de should resolve through the base store"
+
+      assert_equal "SAME", I18n.t(:same, :locale => :de)
+      assert_equal "v1", I18n.t(:differs, :locale => :de)
+    end
+  end
+
+  test "cache: a file written with different framing is discarded" do
+    with_cache_file do |path|
+      # A well-formed Marshal payload that carries no compact cache header.
+      File.binwrite(path, Marshal.dump([:some, :other, :format]))
+      store_translations(:en, :test => "val")
+      I18n.backend.configure_compact_cache(:path => path)
+      I18n.backend.compact!
+
+      assert_equal "val", I18n.t(:test)
+    end
+  end
+
+  test "cache: a serializer that fails to load falls back to fresh compaction" do
+    failing = Module.new do
+      def self.dump(object)
+        Marshal.dump(object)
+      end
+
+      def self.load(_payload)
+        raise "unsupported payload"
+      end
+    end
+
+    with_cache_file do |path|
+      store_translations(:en, :test => "val")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => failing)
+      I18n.backend.compact!
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :test => "val")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => failing)
+      I18n.backend.compact!
+
+      assert_equal "val", I18n.t(:test)
+    end
+  end
+
+  test "cache: a payload missing a field is discarded without leaving mixed state" do
+    truncating = Module.new do
+      def self.dump(object)
+        Marshal.dump(object.reject { |key, _| key == :string_table })
+      end
+
+      def self.load(payload)
+        Marshal.load(payload)
+      end
+    end
+
+    with_cache_file do |path|
+      store_translations(:en, :test => "val")
+      store_translations(:fr, :test => "valeur")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => truncating)
+      I18n.backend.compact!
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :test => "val")
+      store_translations(:fr, :test => "valeur")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => truncating)
+      I18n.backend.compact!
+
+      # The rejected payload must not survive into the fresh compaction.
+      assert_equal "val", I18n.t(:test, :locale => :en)
+      assert_equal "valeur", I18n.t(:test, :locale => :fr)
+      assert_equal "hello", I18n.t(:test, :locale => :de, :default => "hello")
+    end
+  end
+
+  def with_proc_locale_file
+    require 'tempfile'
+    file = Tempfile.new(['i18n_procs', '.rb'])
+    file.write("{ :en => { :my_proc => lambda { |_key, **_opts| 'from proc' } } }")
+    file.close
+    yield file.path
+  ensure
+    file.unlink if file
+  end
+
+  # A serializer whose payload is well formed everywhere except proc_positions,
+  # which load_compact_cache reads at the last step of the load.
+  LATE_FAILURE_SERIALIZER = Module.new do
+    def self.dump(object)
+      Marshal.dump(object.merge(:proc_positions => { 0 => "not a list of keys" }))
+    end
+
+    def self.load(payload)
+      Marshal.load(payload)
+    end
+  end
+
+  test "cache: a payload that fails late leaves the live translations intact" do
+    with_cache_file do |path|
+      I18n.load_path = [locales_dir + '/en.yml', locales_dir + '/en.rb']
+      I18n.backend.configure_compact_cache(:path => path, :serializer => LATE_FAILURE_SERIALIZER)
+      I18n.backend.eager_load!
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml', locales_dir + '/en.rb']
+      I18n.backend.configure_compact_cache(:path => path, :serializer => LATE_FAILURE_SERIALIZER)
+
+      # compact! loads the YAML first, so the backend holds the real nested
+      # trees at the moment the cache load fails. eager_load! would hide this:
+      # it parses the YAML after the failed load and merges over the damage.
+      I18n.backend.compact!
+
+      # The failed load must not have replaced those trees with markers, or the
+      # fresh compaction would compact the markers instead.
+      assert_equal 'baz', I18n.t('foo.bar')
+      assert_equal 'bas', I18n.t('fuh.bah')
+    end
+  end
+
+  test "cache: a proc survives a load that fails before the procs are patched" do
+    with_proc_locale_file do |rb_path|
+      with_cache_file do |path|
+        I18n.load_path = [locales_dir + '/en.yml', rb_path]
+        I18n.backend.configure_compact_cache(:path => path, :serializer => LATE_FAILURE_SERIALIZER)
+        I18n.backend.eager_load!
+        assert_equal 'from proc', I18n.t(:my_proc)
+
+        I18n.backend = CompactBackend.new
+        I18n.load_path = [locales_dir + '/en.yml', rb_path]
+        I18n.backend.configure_compact_cache(:path => path, :serializer => LATE_FAILURE_SERIALIZER)
+        I18n.backend.compact!
+
+        # The load raises inside rebuild_procs!, so the objects table still
+        # holds PROC_PLACEHOLDER where the proc belongs. Recompacting the live
+        # tree recovers the real proc; recompacting the markers would serve the
+        # placeholder Symbol instead.
+        assert_equal 'from proc', I18n.t(:my_proc)
+      end
+    end
+  end
+
+  test "cache: a serializer that returns frozen containers survives a later compact!" do
+    # Paquito freezes its result when built with freeze: true.
+    freezing = Module.new do
+      def self.dump(object)
+        Marshal.dump(object)
+      end
+
+      def self.load(payload)
+        deep_freeze(Marshal.load(payload))
+      end
+
+      def self.deep_freeze(object)
+        case object
+        when Hash then object.each { |key, value| deep_freeze(key); deep_freeze(value) }
+        when Array then object.each { |item| deep_freeze(item) }
+        end
+        object.freeze
+      end
+    end
+
+    with_cache_file do |path|
+      store_translations(:en, :test => "val")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => freezing)
+      I18n.backend.compact!
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      store_translations(:en, :test => "val")
+      I18n.backend.configure_compact_cache(:path => path, :serializer => freezing)
+      I18n.backend.compact!
+      assert_equal "val", I18n.t(:test)
+
+      # Invalidate the cache so the next compact! cannot reload it, and must
+      # rebuild over the frozen containers the serializer returned.
+      File.binwrite(path, "not a compact cache")
+      store_translations(:fr, :test => "valeur")
+      I18n.backend.compact!
+
+      assert_equal "val", I18n.t(:test, :locale => :en)
+      assert_equal "valeur", I18n.t(:test, :locale => :fr)
+    end
+  end
 end
