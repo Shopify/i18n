@@ -89,6 +89,57 @@ class I18nBackendCompactTest < I18n::TestCase
     assert_equal "fr", I18n.t(:differs, :locale => :fr)
   end
 
+  test "compact cache: serves a lookup that happens before eager_load!" do
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "compact.cache")
+
+      writer = CompactBackend.new
+      writer.configure_compact_cache(path: path)
+      writer.eager_load!
+      expected = writer.translate(:en, :"foo.bar")
+
+      reader = CompactBackend.new
+      reader.configure_compact_cache(path: path)
+      # Backend::Simple calls init_translations from lookup, so this is the
+      # shape that bypassed an eager_load!-only hook.
+      assert_equal expected, reader.translate(:en, :"foo.bar")
+      assert reader.send(:initialized?)
+
+      # The value alone proves nothing: parsing the YAML answers it too. The
+      # locale being compacted is what shows the cache served the early load.
+      assert_equal({ :en => true }, reader.instance_variable_get(:@compacted_locales))
+    end
+  end
+
+  test "compact cache: accepts a caller-supplied fingerprint" do
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "compact.cache")
+      calls = 0
+
+      writer = CompactBackend.new
+      writer.configure_compact_cache(path: path, fingerprint: -> { calls += 1; "stable-key" })
+      # Only ever in the cache, never in the load path, so it tells a cache
+      # hit apart from a rebuild.
+      writer.store_translations(:en, :only_in_cache => "cached")
+      writer.eager_load!
+      assert calls > 0
+
+      reader = CompactBackend.new
+      reader.configure_compact_cache(path: path, fingerprint: -> { "stable-key" })
+      reader.eager_load!
+      assert_equal "baz", reader.translate(:en, :"foo.bar")
+      assert_equal "cached", reader.translate(:en, :only_in_cache)
+
+      stale = CompactBackend.new
+      stale.configure_compact_cache(path: path, fingerprint: -> { "different-key" })
+      stale.eager_load!
+      assert_equal "baz", stale.translate(:en, :"foo.bar")
+
+      missing = catch(:exception) { stale.translate(:en, :only_in_cache) }
+      assert_kind_of I18n::MissingTranslation, missing, "a mismatched fingerprint must discard the cache"
+    end
+  end
+
   test "compact!: string values are deduplicated" do
     store_translations(:en, :dedup_a => "hello world")
     store_translations(:en, :dedup_b => "hello world")

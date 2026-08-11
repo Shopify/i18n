@@ -269,11 +269,15 @@ I18n.t("activemodel.errors", locale: :en)
                     └──────────┬──────────┘
                                │
        configure_compact_cache(path: "...")
-                     eager_load!
+                               │
+          eager_load!, or the first lookup or
+          available_locales call — whichever
+          reaches init_translations first
                                │
                   ┌────────────┴────────────┐
                   │ compute fingerprint     │
-                  │ from load_path files    │
+                  │ from load_path files,   │
+                  │ or call fingerprint:    │
                   └────────────┬────────────┘
                                │
                 ┌──────────────┴──────────────┐
@@ -283,7 +287,7 @@ I18n.t("activemodel.errors", locale: :en)
                   yes  │              │  no
                        ▼              ▼
           ┌──────────────────┐  ┌──────────────────┐
-          │  Marshal.load    │  │  load_translations│
+          │  serializer.load │  │  load_translations│
           │  cache file      │  │  (parse all YAML) │
           │                  │  └────────┬─────────┘
           │  Rebuild procs   │           │
@@ -316,8 +320,9 @@ I18n.t("activemodel.errors", locale: :en)
 
 ### Key behaviors
 
-- **`configure_compact_cache(path: "...", digest: false, serializer: Marshal)`** configures the compact cache. When configured, `eager_load!` and `compact!` will use the cache file to skip YAML parsing on cache hit, and write the cache on cache miss. The `digest:` option controls cache invalidation: `false` (default) uses file mtimes, `true` uses SHA256 content digests. The `serializer:` option replaces `Marshal`; it must respond to `dump` and `load`, and `configure_compact_cache` raises `ArgumentError` when it does not.
-- **`eager_load!`** computes a fingerprint from load_path files, then attempts to load from the compact cache (if configured). On cache hit, YAML parsing is skipped entirely (the main performance win). On cache miss, it falls through to `super` (load all YAML), then `compact!`, then writes the compact cache.
+- **`configure_compact_cache(path: "...", digest: false, serializer: Marshal, fingerprint: nil)`** configures the compact cache. When configured, the backend loads the cache file instead of parsing YAML on a cache hit, and writes the cache on a miss. The `digest:` option controls cache invalidation: `false` (default) uses file mtimes, `true` uses SHA256 content digests. The `serializer:` option replaces `Marshal`; it must respond to `dump` and `load`, and `configure_compact_cache` raises `ArgumentError` when it does not. The `fingerprint:` option takes a callable returning a String, for a host that already computes a load-path digest and should not pay for a second one.
+- **`init_translations`** is where the cache is served. `Backend::Simple` calls it from `lookup` and from `available_locales`, so one `I18n.t` during boot parses the whole load path before `eager_load!` is ever reached. Hooking here means the cache serves whatever triggers the load, whenever that happens, which is why `I18nCache`-style caches sit at this level. Shopify Core measured 13,980 ms of loading escaping an `eager_load!`-only hook, with the cache then loading on top of it rather than instead of it.
+- **`eager_load!`** calls `super`, which reaches `init_translations` and so the cache. On a hit there is nothing left to do. On a miss it compacts and writes the cache, reusing the fingerprint `init_translations` already computed.
 - **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged). It consults the cache only while no `store_translations` call has decompacted a locale: the fingerprint covers load_path files alone, so a warm cache would otherwise replace a programmatic write with the cached value.
 - **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted. It also marks the backend dirty, which is what sends the next `compact!` down the full rebuild path instead of the cache.
 - **`reload!`** clears all compacted state and resets to uninitialized.
@@ -387,7 +392,7 @@ Two further properties keep an arbitrary serializer safe:
 
 ### Cache invalidation
 
-Two modes, selected via the `digest:` option:
+Three modes. The first two are selected via the `digest:` option:
 
 **Mtime-based (default):** Hashes sorted file paths + their `File.mtime` values. Fast to compute (~ms), but won't survive mtime resets (e.g., `git checkout`, `rsync --archive`).
 
@@ -400,6 +405,13 @@ I18n.backend.eager_load!
 
 ```ruby
 I18n.backend.configure_compact_cache(path: path, digest: true)
+I18n.backend.eager_load!
+```
+
+**Host-supplied:** A callable passed as `fingerprint:` replaces both. The built-in SHA256 pass sits on the critical path of every boot, including the warm ones the cache exists to make fast: Shopify Core measured it at 4.1 s warm and 15.6 s with a cold page cache. Core already computes an equivalent digest, so it passes that instead and pays for one rather than two. Swapping SHA256 for `I18nCache.digest` took the precompile boot from 15,554 ms to 1,763 ms of fingerprinting.
+
+```ruby
+I18n.backend.configure_compact_cache(path: path, fingerprint: -> { I18nCache.digest })
 I18n.backend.eager_load!
 ```
 
@@ -447,7 +459,7 @@ The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-spe
 |---|---|
 | `lib/i18n/backend/compact.rb` | Implementation (module, ~600 lines) |
 | `lib/i18n/backend.rb` | `autoload :Compact` entry |
-| `test/backend/compact_test.rb` | Unit tests (55 tests, including cache and serializer tests) |
+| `test/backend/compact_test.rb` | Unit tests (57 tests, including cache and serializer tests) |
 | `test/api/compact_test.rb` | API integration tests (143 tests, all standard I18n::Tests modules) |
 | `benchmark/memory.rb` | Synthetic memory benchmark |
 | `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark (includes cache) |

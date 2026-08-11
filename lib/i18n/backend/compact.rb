@@ -121,15 +121,21 @@ module I18n
       # the cache file after compaction on cache miss.
       #
       # Options:
-      #   path:       Path to a compact cache file.
-      #   digest:     When true, use SHA256 content digests for cache
-      #               invalidation instead of file mtimes. Slower to compute
-      #               but survives mtime resets (e.g., during deploys).
-      #               Defaults to false.
-      #   serializer: Object responding to #dump(object) and #load(payload),
-      #               used to encode the cache payload. Defaults to Marshal.
-      #               See "Cache serializers" in the module documentation.
-      def configure_compact_cache(path:, digest: false, serializer: Marshal)
+      #   path:        Path to a compact cache file.
+      #   digest:      When true, use SHA256 content digests for cache
+      #                invalidation instead of file mtimes. Slower to compute
+      #                but survives mtime resets (e.g., during deploys).
+      #                Defaults to false.
+      #   serializer:  Object responding to #dump(object) and #load(payload),
+      #                used to encode the cache payload. Defaults to Marshal.
+      #                See "Cache serializers" in the module documentation.
+      #   fingerprint: Callable returning a String, for hosts that already
+      #                compute a load-path digest and should not pay for a
+      #                second one. Shopify Core measured the built-in SHA256
+      #                content digest at 4.1s warm and 15.6s with a cold page
+      #                cache, which on its own can cost more than the load the
+      #                cache is meant to avoid.
+      def configure_compact_cache(path:, digest: false, serializer: Marshal, fingerprint: nil)
         unless serializer.respond_to?(:dump) && serializer.respond_to?(:load)
           raise ArgumentError, "compact cache serializer must respond to #dump and #load, got #{serializer.inspect}"
         end
@@ -137,25 +143,15 @@ module I18n
         @compact_cache_path = path
         @compact_cache_digest = digest
         @compact_cache_serializer = serializer
+        @compact_cache_fingerprint = fingerprint
       end
 
       # Trigger compaction after eager loading. If a compact cache has been
       # configured via configure_compact_cache, it will be used to skip
       # YAML parsing on cache hit.
       def eager_load!
-        # When a compact cache is configured, try to load directly from
-        # cache BEFORE parsing any YAML files. This skips the expensive
-        # load_translations step entirely on cache hit.
-        if @compact_cache_path
-          fingerprint = compute_compact_cache_fingerprint
-          if load_compact_cache(fingerprint)
-            @initialized = true
-            return
-          end
-        end
-
         super()
-        compact!(_fingerprint: fingerprint)
+        compact!(_fingerprint: @_compact_cache_fingerprint)
       end
 
       # Compact all loaded translations into an optimized columnar structure
@@ -266,6 +262,7 @@ module I18n
         @compacted_locales = nil
         @subtree_keys = nil
         @delta_stats = nil
+        @_compact_cache_fingerprint = nil
         @string_table = nil
         @objects_table = nil
         @_string_builder = nil
@@ -279,6 +276,29 @@ module I18n
       attr_reader :delta_stats
 
       protected
+
+      # Serve the compact cache from init_translations rather than eager_load!.
+      #
+      # eager_load! is too late to be the only hook. Backend::Simple calls
+      # init_translations from `lookup` and from `available_locales`, so a single
+      # I18n.t during boot — one constant defined as a translated string is
+      # enough — parses the whole load path before eager_load! is ever reached.
+      # Shopify Core measured 13,980 ms of loading happening that way, with the
+      # compact cache then loading on top of it rather than instead of it.
+      #
+      # Hooking here means the cache serves whatever triggers the load, whenever
+      # it happens, which is why I18nCache-style caches sit at this level.
+      def init_translations
+        if @compact_cache_path
+          @_compact_cache_fingerprint ||= compute_compact_cache_fingerprint
+          if load_compact_cache(@_compact_cache_fingerprint)
+            @initialized = true
+            return
+          end
+        end
+
+        super
+      end
 
       def lookup(locale, key, scope = [], options = EMPTY_HASH)
         init_translations unless initialized?
@@ -719,6 +739,8 @@ module I18n
       # When @compact_cache_digest is true, uses SHA256 of file contents.
       # Slower but robust across deploys.
       def compute_compact_cache_fingerprint
+        return @compact_cache_fingerprint.call.to_s if @compact_cache_fingerprint
+
         files = I18n.load_path.flatten.sort
         if @compact_cache_digest
           require 'digest/sha2'
