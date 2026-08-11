@@ -140,6 +140,24 @@ class I18nBackendCompactTest < I18n::TestCase
     end
   end
 
+  test "compact!: a key containing the separator survives a subtree lookup" do
+    store_translations(:en, :template_names => { :"Robots.txt" => "Robots.txt", :index => "Index" })
+    I18n.backend.compact!
+
+    assert_equal({ :"Robots.txt" => "Robots.txt", :index => "Index" }, I18n.t(:template_names))
+    assert_equal "Robots.txt", I18n.t(:"template_names.Robots.txt")
+    assert_equal "Translation missing: en.template_names.Robots", I18n.t(:"template_names.Robots")
+  end
+
+  test "compact!: a key containing the separator survives decompaction" do
+    store_translations(:en, :template_names => { :"Robots.txt" => "Robots.txt", :index => "Index" })
+    I18n.backend.compact!
+
+    store_translations(:en, :template_names => { :added => "Added" })
+
+    assert_equal({ :"Robots.txt" => "Robots.txt", :index => "Index", :added => "Added" }, I18n.t(:template_names))
+  end
+
   test "compact!: string values are deduplicated" do
     store_translations(:en, :dedup_a => "hello world")
     store_translations(:en, :dedup_b => "hello world")

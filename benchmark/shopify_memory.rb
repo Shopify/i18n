@@ -274,14 +274,14 @@ compact_result = measure_in_fork(locale_files) do |files|
   schema = backend.instance_variable_get(:@schema)
   value_arrays = backend.instance_variable_get(:@value_arrays)
   translations = backend.instance_variable_get(:@translations)
-  subtree_keys = backend.instance_variable_get(:@subtree_keys)
+  subtree_children = backend.instance_variable_get(:@subtree_children)
   string_table = backend.instance_variable_get(:@string_table)
   objects_table = backend.instance_variable_get(:@objects_table)
 
   schema_stats = measure_retained(schema)
   values_stats = measure_retained(value_arrays)
   tree_stats = measure_retained(translations)
-  subtree_stats = subtree_keys ? measure_retained(subtree_keys) : { bytes: 0, objects: 0 }
+  subtree_stats = subtree_children ? measure_retained(subtree_children) : { bytes: 0, objects: 0 }
   string_table_bytes = string_table ? (ObjectSpace.memsize_of(string_table) rescue 0) : 0
   objects_table_stats = objects_table ? measure_retained(objects_table) : { bytes: 0, objects: 0 }
 
@@ -488,14 +488,14 @@ cached_result = measure_in_fork(locale_files) do |files|
   schema = backend.instance_variable_get(:@schema)
   value_arrays = backend.instance_variable_get(:@value_arrays)
   translations = backend.instance_variable_get(:@translations)
-  subtree_keys = backend.instance_variable_get(:@subtree_keys)
+  subtree_children = backend.instance_variable_get(:@subtree_children)
   string_table = backend.instance_variable_get(:@string_table)
   objects_table = backend.instance_variable_get(:@objects_table)
 
   schema_stats = measure_retained(schema)
   values_stats = measure_retained(value_arrays)
   tree_stats = measure_retained(translations)
-  subtree_stats = subtree_keys ? measure_retained(subtree_keys) : { bytes: 0, objects: 0 }
+  subtree_stats = subtree_children ? measure_retained(subtree_children) : { bytes: 0, objects: 0 }
   string_table_bytes = string_table ? (ObjectSpace.memsize_of(string_table) rescue 0) : 0
   objects_table_stats = objects_table ? measure_retained(objects_table) : { bytes: 0, objects: 0 }
 

@@ -86,12 +86,14 @@ After all translations are loaded, `compact!` transforms the nested tree into fi
                                                │ [<Array>, <Symbol>, <Proc>, ...] │
                                                └──────────────────────────────────┘
 
-                                               @subtree_keys (parent → children index)
+                                               @subtree_children (parent → children)
                                                ┌──────────────────────────────────────┐
+                                               │ nil =>                               │
+                                               │   [[:activemodel,                    │
+                                               │     :"activemodel"]]                 │
                                                │ :"activemodel" =>                    │
-                                               │   [:"activemodel.errors"]            │
-                                               │ :"activemodel.errors" =>             │
-                                               │   [:"activemodel.errors.models"]     │
+                                               │   [[:errors,                         │
+                                               │     :"activemodel.errors"]]          │
                                                │ ...                                  │
                                                └──────────────────────────────────────┘
 
@@ -183,17 +185,22 @@ A shared frozen `Array` holding all non-string leaf values: Arrays (e.g., day na
 
 In the Shopify codebase: only **308 entries**. Nearly all translations are strings.
 
-### 6. `@subtree_keys` — Subtree Children Index
+### 6. `@subtree_children` — Subtree Children Index
 
-A frozen `Hash` mapping each parent key to its direct children's schema keys. Used only for subtree reconstruction when `I18n.t(:some_namespace)` returns a Hash.
+A frozen `Hash` mapping each parent's flat key to an `Array` of its children's own segments. `nil` is the root. Used for subtree reconstruction when `I18n.t(:some_namespace)` returns a Hash, and for decompaction.
 
 ```ruby
 {
-  :"activemodel"        => [:"activemodel.errors"],
-  :"activemodel.errors" => [:"activemodel.errors.models"],
+  nil                   => [:activemodel],
+  :"activemodel"        => [:errors],
+  :"activemodel.errors" => [:models],
   # ...
 }
 ```
+
+The links are recorded while flattening, rather than recovered afterwards by splitting each flat key on its last dot. A key may contain the separator: Shopify Core has `template_names: { "Robots.txt" => … }`, whose flat key `…template_names.Robots.txt` is indistinguishable from a nested `Robots` → `txt`. Splitting invented an intermediate node, and `I18n.t(:template_names)` came back without the entry where `Backend::Simple` returns it.
+
+Only the segment is stored. A reader rebuilds the child's flat key by joining, `:"#{parent_key}.#{segment}"`, which is the same operation flattening performed, so it is exact where splitting was a guess. Storing the child key alongside the segment was measured and rejected: on a 124k-key corpus it made the index 12.0 MB against 8.4 MB, for 35% faster subtree reads and 49% faster decompaction. Both are rare — 0.2 ms per subtree read, 15.6 ms to decompact a locale — so the memory won.
 
 ## Packed Integer Format
 
@@ -251,8 +258,8 @@ I18n.t("activemodel.errors", locale: :en)
 │
 ├─ 1. Schema lookup → idx, value = SUBTREE_SENTINEL
 │
-├─ 2. Look up children: @subtree_keys[:"activemodel.errors"]
-│     → [:"activemodel.errors.models", ...]
+├─ 2. Look up children: @subtree_children[:"activemodel.errors"]
+│     → [:models, ...] → join to :"activemodel.errors.models"
 │
 ├─ 3. Recursively reconstruct nested Hash from children
 │     (each child is either another subtree or a decoded leaf)
@@ -362,7 +369,7 @@ The payload is a Hash:
 | `:value_stores` | Hash | `{ Symbol => Array }` — one tagged store per locale |
 | `:string_table` | String | Binary buffer of concatenated translation strings |
 | `:objects_table` | Array | Non-string values (with Procs replaced by placeholders) |
-| `:subtree_keys` | Hash | `{ Symbol => Array<Symbol> }` — parent→children index |
+| `:subtree_children` | Hash | `{ Symbol => Array<Symbol> }` — parent→children segments |
 | `:proc_positions` | Hash | `{ Integer => [[locale, key], ...] }` — where Procs were |
 
 Each entry in `:value_stores` is tagged, so a store travels as plain data rather than as an object:
@@ -444,7 +451,7 @@ Compact backend:
 │                   on the heap; only the store itself)         │
 │  @string_table:  1 String (90.6 MB, one contiguous buffer)    │
 │  @objects_table: 1 Array (308 entries, 139 KB)                │
-│  @subtree_keys:  1 Hash (10.9 MB for parent→children map)    │
+│  @subtree_children: 1 Hash (10.9 MB for parent→children map) │
 │  Total: 163 MB                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
@@ -459,7 +466,7 @@ The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-spe
 |---|---|
 | `lib/i18n/backend/compact.rb` | Implementation (module, ~600 lines) |
 | `lib/i18n/backend.rb` | `autoload :Compact` entry |
-| `test/backend/compact_test.rb` | Unit tests (57 tests, including cache and serializer tests) |
+| `test/backend/compact_test.rb` | Unit tests (59 tests, including cache and serializer tests) |
 | `test/api/compact_test.rb` | API integration tests (143 tests, all standard I18n::Tests modules) |
 | `benchmark/memory.rb` | Synthetic memory benchmark |
 | `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark (includes cache) |

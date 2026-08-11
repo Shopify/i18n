@@ -157,7 +157,7 @@ GC.start(full_mark: true, immediate_sweep: true)
 compact_schema_stats = measure_retained(compact_backend.instance_variable_get(:@schema))
 compact_values_stats = measure_retained(compact_backend.instance_variable_get(:@value_arrays))
 compact_tree_stats = measure_retained(compact_backend.instance_variable_get(:@translations))
-compact_subtree_stats = measure_retained(compact_backend.instance_variable_get(:@subtree_keys))
+compact_subtree_stats = measure_retained(compact_backend.instance_variable_get(:@subtree_children))
 
 # Binary string table stats
 string_table = compact_backend.instance_variable_get(:@string_table)
