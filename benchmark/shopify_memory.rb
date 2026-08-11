@@ -76,8 +76,12 @@ def measure_retained(root)
   type_bytes = Hash.new(0)
   type_counts = Hash.new(0)
 
-  while (obj = queue.shift)
-    next if seen.key?(obj)
+  # pop until empty rather than `while (obj = queue.shift)`: the subtree index
+  # is keyed by the parent's flat key, and the root's parent is nil, which
+  # would end the walk after one object.
+  until queue.empty?
+    obj = queue.pop
+    next if obj.nil? || seen.key?(obj)
     seen[obj] = true
     total_objects += 1
 
@@ -91,6 +95,11 @@ def measure_retained(root)
       obj.each { |k, v| queue << k; queue << v }
     when Array
       obj.each { |v| queue << v }
+    else
+      # DeltaStore and friends: memsize_of an object excludes what its ivars
+      # point at. Identity-based `seen` also stops the shared base store from
+      # being counted once per delta locale.
+      obj.instance_variables.each { |name| queue << obj.instance_variable_get(name) }
     end
   end
 
@@ -290,23 +299,24 @@ compact_result = measure_in_fork(locale_files) do |files|
   total_objects = schema_stats[:objects] + values_stats[:objects] + tree_stats[:objects] +
                   subtree_stats[:objects] + 1 + objects_table_stats[:objects]
 
-  # Count string refs and object refs
+  # Count string refs and object refs. Stores are keyed by schema index, and a
+  # non-base locale keeps only its overrides, so iterate the stored values
+  # rather than an Array of slots.
   total_string_refs = 0
   total_object_refs = 0
   total_subtree_markers = 0
   unique_packed = {}
-  value_arrays.each do |_, arr|
-    arr.each do |v|
-      next if v.nil?
-      if v.is_a?(Integer)
-        if v == -(1 << 62)
-          total_subtree_markers += 1
-        elsif v >= 0
-          total_string_refs += 1
-          unique_packed[v] = true
-        else
-          total_object_refs += 1
-        end
+  value_arrays.each_value do |store|
+    packed_values = store.is_a?(Hash) ? store.each_value : store.overrides.each_value
+    packed_values.each do |v|
+      next unless v.is_a?(Integer)
+      if v == -(1 << 62)
+        total_subtree_markers += 1
+      elsif v >= 0
+        total_string_refs += 1
+        unique_packed[v] = true
+      else
+        total_object_refs += 1
       end
     end
   end
@@ -366,6 +376,7 @@ compact_result = measure_in_fork(locale_files) do |files|
     total_subtree_markers: total_subtree_markers,
     unique_packed_refs: unique_packed.size,
     errors: errors,
+    delta_stats: backend.delta_stats,
     sample_keys: sample_keys,
   }
 end
@@ -403,17 +414,23 @@ puts "  Lookup (50k):     #{'%.1f' % (compact_result[:lookup_time] * 1000)} ms"
 puts "  Load errors:      #{compact_result[:errors]}"
 puts "  Breakdown:"
 puts "    Schema hash:     #{format_bytes(compact_result[:schema_bytes])} (#{format_number(compact_result[:schema_objects])} objects)"
-puts "    Value arrays:    #{format_bytes(compact_result[:values_bytes])} (#{format_number(compact_result[:values_objects])} objects)"
+puts "    Value stores:    #{format_bytes(compact_result[:values_bytes])} (#{format_number(compact_result[:values_objects])} objects)"
 puts "    String table:    #{format_bytes(compact_result[:string_table_bytes])} (1 buffer, #{format_bytes(compact_result[:string_table_data_bytes])} data)"
 puts "    Objects table:   #{format_bytes(compact_result[:objects_table_bytes])} (#{format_number(compact_result[:objects_table_entries])} entries)"
 puts "    Subtree index:   #{format_bytes(compact_result[:subtree_bytes])} (#{format_number(compact_result[:subtree_objects])} objects)"
 puts "    Marker tree:     #{format_bytes(compact_result[:tree_bytes])} (#{format_number(compact_result[:tree_objects])} objects)"
 puts "  String table stats:"
-puts "    String refs across locales: #{format_number(compact_result[:total_string_refs])}"
+puts "    Packed string refs stored:  #{format_number(compact_result[:total_string_refs])}"
 puts "    Unique packed refs:         #{format_number(compact_result[:unique_packed_refs])}"
 puts "    Dedup ratio:                #{'%.1f' % (compact_result[:total_string_refs].to_f / [compact_result[:unique_packed_refs], 1].max)}x"
 puts "    Object table entries:       #{format_number(compact_result[:objects_table_entries])}"
 puts "    Subtree markers:            #{format_number(compact_result[:total_subtree_markers])}"
+if (ds = compact_result[:delta_stats])
+  elided = ds[:total] > 0 ? (ds[:inherited] * 100.0 / ds[:total]) : 0
+  puts "  Base-locale delta:"
+  puts "    Base locale:                #{ds[:base].inspect}"
+  puts "    Inherited from base:        #{format_number(ds[:inherited])} of #{format_number(ds[:total])} entries (#{'%.1f' % elided}% elided)"
+end
 
 puts
 puts "=" * 70

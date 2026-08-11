@@ -68,8 +68,12 @@ def measure_retained(root)
   type_bytes = Hash.new(0)
   type_counts = Hash.new(0)
 
-  while (obj = queue.shift)
-    next if seen.key?(obj)
+  # pop until empty rather than `while (obj = queue.shift)`: the subtree index
+  # is keyed by the parent's flat key, and the root's parent is nil, which
+  # would end the walk after one object.
+  until queue.empty?
+    obj = queue.pop
+    next if obj.nil? || seen.key?(obj)
     seen[obj] = true
     total_objects += 1
 
@@ -83,6 +87,11 @@ def measure_retained(root)
       obj.each { |k, v| queue << k; queue << v }
     when Array
       obj.each { |v| queue << v }
+    else
+      # DeltaStore and friends: memsize_of an object excludes what its ivars
+      # point at. Identity-based `seen` also stops the shared base store from
+      # being counted once per delta locale.
+      obj.instance_variables.each { |name| queue << obj.instance_variable_get(name) }
     end
   end
 
@@ -109,6 +118,12 @@ translations_data = {}
 locales.each_with_index do |locale, i|
   translations_data[locale] = generate_translations(NUM_TOP_KEYS, i)
 end
+
+# The base-locale delta only fires for the default locale, so point it at one
+# of the generated locales. Left at :en the benchmark measures a configuration
+# no application runs.
+I18n.enforce_available_locales = false
+I18n.default_locale = locales.first
 
 leaf_count = NUM_LOCALES * (NUM_TOP_KEYS * 5 * (8 + 2) + 4 + 7 + 7 + 13)
 
@@ -202,7 +217,7 @@ puts "  Retained memory:  #{format_bytes(compact_total_bytes)}"
 puts "  Retained objects: #{format_number(compact_total_objects)}"
 puts "  Breakdown:"
 puts "    Schema hash:     #{format_bytes(compact_schema_stats[:bytes])} (#{format_number(compact_schema_stats[:objects])} objects)"
-puts "    Value arrays:    #{format_bytes(compact_values_stats[:bytes])} (#{format_number(compact_values_stats[:objects])} objects)"
+puts "    Value stores:    #{format_bytes(compact_values_stats[:bytes])} (#{format_number(compact_values_stats[:objects])} objects)"
 puts "    String table:    #{format_bytes(string_table_bytes)} (1 buffer, #{string_table ? format_bytes(string_table.bytesize) : '0 B'} data)"
 puts "    Objects table:   #{format_bytes(objects_table_stats[:bytes])} (#{format_number(objects_table_stats[:objects])} objects)"
 puts "    Subtree index:   #{format_bytes(compact_subtree_stats[:bytes])} (#{format_number(compact_subtree_stats[:objects])} objects)"
@@ -232,22 +247,30 @@ puts "-" * 70
 puts "String Table"
 puts "-" * 70
 if string_table
-  # Count total string refs across all locales
+  # Stores are keyed by schema index, and a non-base locale keeps only its
+  # overrides, so iterate the stored values rather than an Array of slots.
   value_arrays = compact_backend.instance_variable_get(:@value_arrays)
   total_string_refs = 0
   unique_packed = {}
-  value_arrays.each do |_, arr|
-    arr.each do |v|
+  value_arrays.each_value do |store|
+    packed_values = store.is_a?(Hash) ? store.each_value : store.overrides.each_value
+    packed_values.each do |v|
       next unless v.is_a?(Integer) && v >= 0
       total_string_refs += 1
       unique_packed[v] = true
     end
   end
+  delta_stats = compact_backend.delta_stats
   puts "  String buffer size:         #{format_bytes(string_table.bytesize)}"
-  puts "  String refs across locales: #{format_number(total_string_refs)}"
+  puts "  Packed string refs stored:  #{format_number(total_string_refs)}"
   puts "  Unique packed refs:         #{format_number(unique_packed.size)}"
   puts "  Dedup ratio:                #{'%.1f' % (total_string_refs.to_f / [unique_packed.size, 1].max)}x"
   puts "  Objects table entries:      #{format_number(objects_table ? objects_table.size : 0)}"
+  if delta_stats
+    elided = delta_stats[:total] > 0 ? (delta_stats[:inherited] * 100.0 / delta_stats[:total]) : 0
+    puts "  Base locale:                #{delta_stats[:base].inspect}"
+    puts "  Entries inherited from base: #{format_number(delta_stats[:inherited])} of #{format_number(delta_stats[:total])} (#{'%.1f' % elided}% elided)"
+  end
 else
   puts "  (no string table — not using binary string table approach)"
 end
