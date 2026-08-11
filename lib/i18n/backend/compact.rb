@@ -551,7 +551,12 @@ module I18n
       # storing values in the value array as packed integers.
       def flatten_into_columns(prefix, hash, values)
         hash.each do |key, value|
-          segment = key.is_a?(Symbol) ? key : key.to_s.to_sym
+          # Recorded verbatim. store_translations has already applied i18n's
+          # key rule, symbolizing anything that answers to_sym and leaving the
+          # rest alone, so this is the key Simple keeps and the key a reader
+          # must hand back. Symbolizing it again turns a CLDR month index from
+          # 1 into :"1", and every caller indexing a subtree by number gets nil.
+          segment = key
           flat_key = prefix ? :"#{prefix}.#{key}" : key.to_s.to_sym
 
           # Get or create the schema index for this key.
@@ -660,6 +665,15 @@ module I18n
         end
       end
 
+      # A child's flat key, as flattening built it. Interpolation makes a
+      # nested key a Symbol whatever the segment's type, but a root segment is
+      # used as the flat key directly and the schema holds the symbolized form.
+      def child_flat_key(parent_key, segment)
+        return :"#{parent_key}.#{segment}" if parent_key
+
+        segment.is_a?(Symbol) ? segment : segment.to_s.to_sym
+      end
+
       # Reconstruct a nested Hash subtree using the subtree index.
       def reconstruct_subtree(locale, parent_key)
         children = @subtree_children[parent_key]
@@ -669,7 +683,7 @@ module I18n
         result = {}
 
         children.each do |segment|
-          child_key = parent_key ? :"#{parent_key}.#{segment}" : segment
+          child_key = child_flat_key(parent_key, segment)
           packed = values[@schema[child_key]]
           next if packed.nil?
 
@@ -705,7 +719,7 @@ module I18n
         return unless children
 
         children.each do |segment|
-          child_key = parent_key ? :"#{parent_key}.#{segment}" : segment
+          child_key = child_flat_key(parent_key, segment)
           packed = values[@schema[child_key]]
           next if packed.nil?
 

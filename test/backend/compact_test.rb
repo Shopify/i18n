@@ -950,4 +950,50 @@ class I18nBackendCompactTest < I18n::TestCase
       assert_equal "valeur", I18n.t(:test, :locale => :fr)
     end
   end
+
+  test "subtree: a key that is not a Symbol keeps its type" do
+    data = { calendars: { months: { 1 => 'January', 2 => 'February' } } }
+    I18n.backend.store_translations(:en, data)
+    I18n.backend.eager_load!
+
+    simple = I18n::Backend::Simple.new
+    simple.store_translations(:en, data)
+
+    subtree = I18n.t('calendars.months')
+    assert_equal simple.send(:lookup, :en, :'calendars.months'), subtree
+    assert_equal 'January', subtree[1]
+  end
+
+  test "rebuild_nested_tree!: a key that is not a Symbol keeps its type" do
+    data = { calendars: { months: { 1 => 'January', 2 => 'February' } } }
+    I18n.backend.store_translations(:en, data)
+    I18n.backend.eager_load!
+    I18n.backend.send(:rebuild_nested_tree!, :en)
+
+    simple = I18n::Backend::Simple.new
+    simple.store_translations(:en, data)
+
+    assert_equal simple.send(:translations)[:en][:calendars],
+      I18n.backend.send(:translations)[:en][:calendars]
+  end
+
+  test "rebuild_nested_tree!: a non-Symbol key at the root survives decompaction" do
+    # The root is the one place where the segment is also the flat key, and
+    # flattening symbolizes the flat key. A reader that skips that conversion
+    # looks up a schema key that does not exist, and drops the whole branch.
+    data = { 1 => { :a => 'root-int-child' }, :normal => { 2 => 'nested-int' } }
+    I18n.backend.store_translations(:en, data)
+    I18n.backend.eager_load!
+    I18n.backend.send(:rebuild_nested_tree!, :en)
+
+    simple = I18n::Backend::Simple.new
+    simple.store_translations(:en, data)
+
+    # eager_load! also pulls in the fixture load path, so compare the branches
+    # this test stored rather than the whole locale.
+    rebuilt = I18n.backend.send(:translations)[:en]
+    expected = simple.send(:translations)[:en]
+    assert_equal expected[1], rebuilt[1]
+    assert_equal expected[:normal], rebuilt[:normal]
+  end
 end

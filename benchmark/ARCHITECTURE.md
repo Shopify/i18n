@@ -187,13 +187,14 @@ In the Shopify codebase: only **308 entries**. Nearly all translations are strin
 
 ### 6. `@subtree_children` — Subtree Children Index
 
-A frozen `Hash` mapping each parent's flat key to an `Array` of its children's own segments. `nil` is the root. Used for subtree reconstruction when `I18n.t(:some_namespace)` returns a Hash, and for decompaction.
+A frozen `Hash` mapping each parent's flat key to an `Array` of its children's own segments, recorded with the type the key had. `nil` is the root. Used for subtree reconstruction when `I18n.t(:some_namespace)` returns a Hash, and for decompaction.
 
 ```ruby
 {
   nil                   => [:activemodel],
   :"activemodel"        => [:errors],
   :"activemodel.errors" => [:models],
+  :"calendars.months"   => [1, 2, 3],   # CLDR keys months by Integer
   # ...
 }
 ```
@@ -201,6 +202,8 @@ A frozen `Hash` mapping each parent's flat key to an `Array` of its children's o
 The links are recorded while flattening, rather than recovered afterwards by splitting each flat key on its last dot. A key may contain the separator: Shopify Core has `template_names: { "Robots.txt" => … }`, whose flat key `…template_names.Robots.txt` is indistinguishable from a nested `Robots` → `txt`. Splitting invented an intermediate node, and `I18n.t(:template_names)` came back without the entry where `Backend::Simple` returns it.
 
 Only the segment is stored. A reader rebuilds the child's flat key by joining, `:"#{parent_key}.#{segment}"`, which is the same operation flattening performed, so it is exact where splitting was a guess. Storing the child key alongside the segment was measured and rejected: on a 124k-key corpus it made the index 12.0 MB against 8.4 MB, for 35% faster subtree reads and 49% faster decompaction. Both are rare — 0.2 ms per subtree read, 15.6 ms to decompact a locale — so the memory won.
+
+A reader hands the segment straight back as the key of the Hash it returns, so the segment must carry the type `Backend::Simple` would have kept. `store_translations` has already applied i18n's key rule by then, symbolizing anything that answers `to_sym` and leaving the rest alone, so the key is recorded verbatim. Symbolizing it again turned a CLDR month index from `1` into `:"1"`, and `I18n.t("calendars.months")[1]` returned `nil`. Only the flat key is symbolized, through `child_flat_key`, because the schema holds the symbolized form.
 
 ## Packed Integer Format
 
@@ -369,7 +372,7 @@ The payload is a Hash:
 | `:value_stores` | Hash | `{ Symbol => Array }` — one tagged store per locale |
 | `:string_table` | String | Binary buffer of concatenated translation strings |
 | `:objects_table` | Array | Non-string values (with Procs replaced by placeholders) |
-| `:subtree_children` | Hash | `{ Symbol => Array<Symbol> }` — parent→children segments |
+| `:subtree_children` | Hash | `{ Symbol => Array }` — parent→children segments, original key types |
 | `:proc_positions` | Hash | `{ Integer => [[locale, key], ...] }` — where Procs were |
 
 Each entry in `:value_stores` is tagged, so a store travels as plain data rather than as an object:
@@ -466,7 +469,7 @@ The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-spe
 |---|---|
 | `lib/i18n/backend/compact.rb` | Implementation (module, ~600 lines) |
 | `lib/i18n/backend.rb` | `autoload :Compact` entry |
-| `test/backend/compact_test.rb` | Unit tests (59 tests, including cache and serializer tests) |
+| `test/backend/compact_test.rb` | Unit tests (62 tests, including cache and serializer tests) |
 | `test/api/compact_test.rb` | API integration tests (143 tests, all standard I18n::Tests modules) |
 | `benchmark/memory.rb` | Synthetic memory benchmark |
 | `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark (includes cache) |
