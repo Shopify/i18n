@@ -318,8 +318,8 @@ I18n.t("activemodel.errors", locale: :en)
 
 - **`configure_compact_cache(path: "...", digest: false, serializer: Marshal)`** configures the compact cache. When configured, `eager_load!` and `compact!` will use the cache file to skip YAML parsing on cache hit, and write the cache on cache miss. The `digest:` option controls cache invalidation: `false` (default) uses file mtimes, `true` uses SHA256 content digests. The `serializer:` option replaces `Marshal`; it must respond to `dump` and `load`, and `configure_compact_cache` raises `ArgumentError` when it does not.
 - **`eager_load!`** computes a fingerprint from load_path files, then attempts to load from the compact cache (if configured). On cache hit, YAML parsing is skipped entirely (the main performance win). On cache miss, it falls through to `super` (load all YAML), then `compact!`, then writes the compact cache.
-- **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged).
-- **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted.
+- **`compact!`** is idempotent — calling it again when nothing changed is a no-op. If new translations were added since the last compaction, it rebuilds everything from scratch (since packed integer references can't be incrementally merged). It consults the cache only while no `store_translations` call has decompacted a locale: the fingerprint covers load_path files alone, so a warm cache would otherwise replace a programmatic write with the cached value.
+- **`store_translations`** after compaction decompacts only the affected locale by calling `rebuild_nested_tree!`, which reconstitutes the nested Hash from the flat index. The other locales remain compacted. It also marks the backend dirty, which is what sends the next `compact!` down the full rebuild path instead of the cache.
 - **`reload!`** clears all compacted state and resets to uninitialized.
 - **`lookup`** checks `@compacted_locales` to decide whether to use the fast columnar path or fall through to the Simple backend's nested Hash traversal.
 - **`delta_stats`** reports how many entries `apply_base_delta!` elided. It is `nil` before compaction.
@@ -447,7 +447,7 @@ The key insight: Ruby's per-object overhead (~40 bytes for the RValue + type-spe
 |---|---|
 | `lib/i18n/backend/compact.rb` | Implementation (module, ~600 lines) |
 | `lib/i18n/backend.rb` | `autoload :Compact` entry |
-| `test/backend/compact_test.rb` | Unit tests (52 tests, including cache and serializer tests) |
+| `test/backend/compact_test.rb` | Unit tests (55 tests, including cache and serializer tests) |
 | `test/api/compact_test.rb` | API integration tests (143 tests, all standard I18n::Tests modules) |
 | `benchmark/memory.rb` | Synthetic memory benchmark |
 | `benchmark/shopify_memory.rb` | Real Shopify files memory benchmark (includes cache) |

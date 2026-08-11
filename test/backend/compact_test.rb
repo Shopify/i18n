@@ -442,6 +442,65 @@ class I18nBackendCompactTest < I18n::TestCase
     end
   end
 
+  # Runtime writes against a warm cache
+
+  test "cache: recompacting keeps a store_translations write the cache cannot see" do
+    with_cache_file do |path|
+      store_translations(:en, :greet => "v1")
+      I18n.backend.configure_compact_cache(:path => path)
+      I18n.backend.compact!
+      before = File.binread(path)
+
+      # The fingerprint covers load_path files only, so the cache still looks
+      # valid after this write. :en is the only cached locale, which empties
+      # @compacted_locales, so the guard cannot be inferred from that.
+      store_translations(:en, :greet => "v2")
+      assert_equal "v2", I18n.t(:greet)
+
+      I18n.backend.compact!
+
+      assert_equal "v2", I18n.t(:greet)
+      refute_equal before, File.binread(path), "the cache should be rewritten with the new value"
+    end
+  end
+
+  test "cache: recompacting after a cache hit keeps the write and the other locales" do
+    with_cache_file do |path|
+      store_translations(:en, :greet => "Hello")
+      store_translations(:fr, :greet => "Bonjour")
+      I18n.backend.configure_compact_cache(:path => path)
+      I18n.backend.compact!
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      I18n.backend.configure_compact_cache(:path => path)
+      I18n.backend.compact!
+      assert_equal "Bonjour", I18n.t(:greet, :locale => :fr)
+
+      store_translations(:en, :greet => "OVERRIDE")
+      I18n.backend.compact!
+
+      assert_equal "OVERRIDE", I18n.t(:greet, :locale => :en)
+      assert_equal "Bonjour", I18n.t(:greet, :locale => :fr)
+    end
+  end
+
+  test "cache: a fresh backend still takes the cache fast path" do
+    with_cache_file do |path|
+      store_translations(:en, :greet => "cached")
+      I18n.backend.configure_compact_cache(:path => path)
+      I18n.backend.compact!
+
+      I18n.backend = CompactBackend.new
+      I18n.load_path = [locales_dir + '/en.yml']
+      I18n.backend.configure_compact_cache(:path => path)
+      I18n.backend.compact!
+
+      # Served from the cache: the value was never stored on this backend.
+      assert_equal "cached", I18n.t(:greet)
+    end
+  end
+
   test "cache: handles missing compact cache file gracefully" do
     store_translations(:en, :test => 'val')
     I18n.backend.configure_compact_cache(path: '/tmp/nonexistent_i18n_cache_file_that_does_not_exist.cache')

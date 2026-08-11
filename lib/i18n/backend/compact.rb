@@ -179,7 +179,12 @@ module I18n
         return if !has_pending
 
         # Try loading from compact cache if configured.
-        if @compact_cache_path
+        #
+        # Skipped once store_translations has decompacted a locale. The
+        # fingerprint covers only load_path files, so a programmatic write is
+        # invisible to it: the cache still matches, and loading it would
+        # silently replace the write with the cached value.
+        if @compact_cache_path && !@compact_dirty
           fingerprint = _fingerprint || compute_compact_cache_fingerprint
           if load_compact_cache(fingerprint)
             return
@@ -226,6 +231,10 @@ module I18n
         # Keep only the values that differ from the base locale's.
         apply_base_delta!
 
+        # Every locale is compacted from the live tree again, so the state
+        # matches what the cache below is about to hold.
+        @compact_dirty = false
+
         # Write compact cache for next boot.
         if @compact_cache_path
           fingerprint ||= compute_compact_cache_fingerprint
@@ -240,6 +249,11 @@ module I18n
         # from the flat index so that the new data can be deep-merged in.
         if @compacted_locales&.dig(locale)
           rebuild_nested_tree!(locale)
+
+          # The live tree now differs from the cache. Recorded here rather than
+          # inferred from @compacted_locales, which rebuild_nested_tree! empties
+          # when the cache holds a single locale.
+          @compact_dirty = true
         end
 
         super
@@ -256,6 +270,7 @@ module I18n
         @objects_table = nil
         @_string_builder = nil
         @_objects_builder = nil
+        @compact_dirty = nil
         super
       end
 
