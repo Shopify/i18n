@@ -475,10 +475,16 @@ module I18n
       end
     end
 
-    @@normalized_key_cache = I18n.new_double_nested_cache
+    def normalized_key_cache
+      if defined?(Ractor)
+        Ractor.current[:i18n_normalized_key_cache] ||= I18n.new_double_nested_cache
+      else
+        @@normalized_key_cache ||= I18n.new_double_nested_cache
+      end
+    end
 
     def normalize_key(key, separator)
-      @@normalized_key_cache[separator][key] ||=
+      normalized_key_cache[separator][key] ||=
         case key
         when Array
           key.flat_map { |k| normalize_key(k, separator) }
