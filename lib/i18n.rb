@@ -130,6 +130,7 @@ module I18n
     # is useful.
     def eager_load!
       config.backend.eager_load!
+      Locale::Tag.implementation
     end
 
     # Translates, pluralizes and interpolates a given key using a given locale,
