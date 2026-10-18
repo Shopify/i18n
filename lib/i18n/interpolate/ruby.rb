@@ -9,7 +9,7 @@ module I18n
     /%\{([\w|]+)\}/,                            # matches placeholders like "%{foo} or %{foo|word}"
     /%<(\w+)>([^\d]*?\d*\.?\d*[bBdiouxXeEfgGcps])/  # matches placeholders like "%<foo>.d"
   ].freeze
-  INTERPOLATION_PATTERN = Regexp.union(DEFAULT_INTERPOLATION_PATTERNS)
+  INTERPOLATION_PATTERN = Regexp.union(DEFAULT_INTERPOLATION_PATTERNS).freeze
   deprecate_constant :INTERPOLATION_PATTERN
 
   def self.interpolation_patterns_cache
